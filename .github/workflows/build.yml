@@ -1,0 +1,100 @@
+# Compila los dos firmware en cada cambio de main y deja los binarios en la
+# rama `builds`, que es de donde los baja Oryx Signal Studio para cargarlos en
+# el ESP32 desde el navegador. La rama se rehace entera en cada corrida: solo
+# guarda la última compilación.
+#
+# Los archivos se escriben en las mismas direcciones que usa el Arduino IDE
+# (ver manifest.json), así la zona de ajustes (NVS) no se toca y el equipo
+# conserva la red WiFi guardada.
+
+name: Compilar firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-firmware
+  cancel-in-progress: true
+
+env:
+  CORE: esp32:esp32@3.3.0
+  FQBN: esp32:esp32:esp32
+  INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Core ESP32 y librerías
+        run: |
+          arduino-cli core update-index --additional-urls "$INDEX_URL"
+          arduino-cli core install "$CORE" --additional-urls "$INDEX_URL"
+          # Las del firmware SD; el de USB/WiFi no usa librerías externas
+          arduino-cli lib install U8g2 ESP32Encoder Button2
+
+      - name: Compilar
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for nombre in oryx_signal_esp32 oryx_signal_sd; do
+            # El .ino puede estar en la raíz o en su propia carpeta
+            if [ -f "$nombre/$nombre.ino" ]; then fuente="$nombre/$nombre.ino"; else fuente="$nombre.ino"; fi
+            # arduino-cli exige que la carpeta se llame como el sketch
+            mkdir -p "sketch/$nombre"
+            cp "$fuente" "sketch/$nombre/$nombre.ino"
+            arduino-cli compile --fqbn "$FQBN" --build-path "build/$nombre" "sketch/$nombre"
+            cp "build/$nombre/$nombre.ino.bootloader.bin" "out/$nombre.bootloader.bin"
+            cp "build/$nombre/$nombre.ino.partitions.bin" "out/$nombre.partitions.bin"
+            cp "build/$nombre/$nombre.ino.bin"            "out/$nombre.app.bin"
+            echo "$nombre=$fuente" >> fuentes.txt
+          done
+          cp "$(find ~/.arduino15/packages/esp32/hardware/esp32 -name boot_app0.bin | head -n 1)" out/boot_app0.bin
+
+      - name: Manifiesto
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os
+          fuentes = dict(l.strip().split('=', 1) for l in open('fuentes.txt'))
+          def firmware(nombre):
+              return {
+                  'source': fuentes[nombre],
+                  'chip': 'ESP32',
+                  'parts': [
+                      {'file': f'{nombre}.bootloader.bin', 'address': 0x1000},
+                      {'file': f'{nombre}.partitions.bin', 'address': 0x8000},
+                      {'file': 'boot_app0.bin',            'address': 0xe000},
+                      {'file': f'{nombre}.app.bin',        'address': 0x10000},
+                  ],
+              }
+          manifest = {
+              'commit': os.environ['GITHUB_SHA'],
+              'date': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+              'core': os.environ['CORE'],
+              'firmwares': {
+                  'esp32': firmware('oryx_signal_esp32'),
+                  'sd': firmware('oryx_signal_sd'),
+              },
+          }
+          json.dump(manifest, open('out/manifest.json', 'w'), indent=2)
+          PY
+          cat out/manifest.json
+
+      - name: Publicar en la rama builds
+        run: |
+          set -euo pipefail
+          cd out
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Binarios de ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" builds
