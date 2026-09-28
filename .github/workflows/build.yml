@@ -7,8 +7,12 @@
 # - En un pull request (también desde un fork) solo se compila: el job no
 #   tiene permiso de escritura ni secretos, y nunca se publica nada. Por eso
 #   se usa `pull_request` y jamás `pull_request_target`.
-# - Publicar es un job aparte, el único con `contents: write`, y corre solo
-#   después de un push a main, es decir, con código ya revisado y aceptado.
+# - Publicar es un job aparte y corre solo después de un push a main, es
+#   decir, con código ya revisado y aceptado. Escribe con una deploy key que
+#   vive como secreto del environment `publicar-builds`, que solo acepta la
+#   rama main: ni los pull requests ni otras ramas pueden leerla. La rama
+#   `builds` tiene un ruleset que solo deja pasar a esa clave y a los
+#   administradores. El GITHUB_TOKEN no tiene escritura en ningún job.
 # - Las actions van fijadas por SHA (lo exige la configuración del
 #   repositorio). Dependabot propone las actualizaciones.
 #
@@ -116,8 +120,8 @@ jobs:
     # Solo código que ya está en main; nunca desde un pull request
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    environment: publicar-builds
+    permissions: {}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -126,13 +130,22 @@ jobs:
 
       - name: Publicar en la rama builds
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_KEY: ${{ secrets.BUILDS_DEPLOY_KEY }}
         run: |
           set -euo pipefail
+          # La clave solo existe durante este paso, fuera del directorio publicado
+          ssh_dir="$RUNNER_TEMP/ssh"
+          mkdir -p -m 700 "$ssh_dir"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key"
+          chmod 600 "$ssh_dir/key"
+          # Huella oficial de GitHub (api.github.com/meta), sin confiar en la primera conexión
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
           cd out
           git init -q -b builds
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -q -m "Binarios de ${GITHUB_SHA::7}"
-          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" builds
+          git push -f "git@github.com:${GITHUB_REPOSITORY}.git" builds
+          rm -rf "$ssh_dir"
