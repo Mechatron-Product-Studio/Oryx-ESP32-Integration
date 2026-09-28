@@ -1,0 +1,9 @@
+# Quién tiene que aprobar cada cambio antes de que entre a main.
+# Todo lo que se aprueba acá llega a Oryx Signal Studio: el código se muestra
+# en la web y los binarios se cargan en las placas desde el navegador.
+
+*            @diegovaldef
+
+# Los workflows publican los binarios con permiso de escritura: un cambio
+# acá necesita siempre la revisión de un responsable.
+/.github/    @diegovaldef
