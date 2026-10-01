@@ -6,32 +6,62 @@
  * card. One sketch for both export modes: the mode is detected from the file.
  *
  *   digital  → one row per state change: step + one 0/1 column per channel.
- *              Out on 4 GPIOs (CKP, CMP 1, CMP 2, CMP 3).
+ *              Up to 16 channels are read. The first 4 go out on GPIOs (CKP,
+ *              CMP 1, CMP 2, CMP 3); channels 5 to 16 are kept with the
+ *              signal and handed to writeExtraChannels() for your own code.
  *   analog   → one row per chord segment (from, to, channel, levels, handle,
  *              radius, corner radius) plus "RESOLUTION (bits)" metadata. The
  *              curve is rebuilt here with the same geometry as the editor and
  *              sampled into RAM, then played through the two DACs.
  *
+ * Big files: a digital file is first read once in 8 KB blocks (metadata,
+ * row count, first/last step) with a percentage on screen. If its events fit
+ * in RAM it plays from memory, exactly as before. If not (millions of steps),
+ * it is STREAMED: a reader task on core 1 keeps a 4096-event ring buffer full
+ * from the card while core 0 plays it with the same absolute clock, going
+ * back to the start of the file at the end of every pass. If the card cannot
+ * keep up with a very fast signal, the output holds and the gap is counted as
+ * an "underrun" (see "status").
+ *
  * Two ways to drive it — the SD card is always required:
- *   · OLED + encoder: browse, choose cycles, change RPM on the fly.
+ *   · OLED + encoder: browse, pick the speed unit when a file opens, play,
+ *     and edit the speed digit by digit while it plays: turn to move between
+ *     the digits, click to edit one (it blinks), turn to change it, click to
+ *     finish. A double click switches the unit.
  *   · Serial only (115200 baud): type "help". Works with or without the
  *     OLED and the encoder attached; both can be used at the same time.
  * The OLED is detected at boot (I2C 0x3C / 0x3D). Without it every screen is
  * skipped and the serial console does the whole job.
  *
- * Speed is set in RPM (100 – 8000):
+ * Speed, in the unit you pick (OLED double click, or "unit" on serial):
  *
- *   step_time (µs) = 60 000 000 / (RPM × total_steps)
+ *   RPM    100 – 8000        step_time = 60 000 000 / (RPM × total_steps)
+ *   us     2.5 – 1 000 000   step_time = the value, µs per step
+ *   bps    1 – 400 000       step_time = 1 000 000 / bps (one step = one bit)
+ *   Hz     0.5 – 200 000     step_time = 1 000 000 / (2 × Hz): a clock period
+ *                            is two steps, one high and one low (I2C, SPI)
+ * Timing runs on the CPU cycle counter (240 cycles per µs), so a 2.5 µs step
+ * is kept to a fraction of a microsecond. Steps that short only hold from RAM:
+ * a streamed file is limited by how fast the card reads (see Big files).
  *
  * File metadata (all optional, at the end of the file):
- *   VOLTAGE: 5            analog: scales the DAC output
- *   STEP_TIME (us): 1000  diagnostic only (compared against the RPM tick)
- *   CYCLES: 2             cycles in the signal; if present, config is skipped
- *   RPM: 800              start speed
+ *   VOLTAGE: 5            read and kept in metaVoltage, not used: it is there
+ *                         for whoever adapts this firmware to their circuit
+ *   STEP_TIME (us): 1000  start speed (µs/step) — used first
+ *   RPM: 800              start speed (RPM) — used when there is no STEP_TIME
+ * The start speed is shown in the unit you pick when the file opens (the
+ * last one used is preselected and survives a power cycle).
+ * A file opens and plays right away. Older exports may still carry a
+ * "CYCLES:" line: it is skipped.
  *
- * Libraries: U8g2, ESP32Encoder, Button2. Board: classic ESP32 (WROOM /
- * DevKit v1). Also builds as a PlatformIO main.cpp: everything is declared
- * before it is used.
+ * Libraries: U8g2, ESP32Encoder, Button2. Boards: classic ESP32 (WROOM /
+ * DevKit v1) and ESP32-S3 (DevKitC-1 and compatibles). Also builds as a
+ * PlatformIO main.cpp: everything is declared before it is used.
+ *
+ * ESP32-S3: it has no DAC, so it plays digital files only (analog ones are
+ * refused with a message) and its pins differ — see PIN CONFIGURATION. Build
+ * it with "USB CDC On Boot" enabled: the serial console then answers on both
+ * connectors of the board, the native USB one and the UART bridge.
  */
 
 #include <Arduino.h>
@@ -41,16 +71,71 @@
 #include <SPI.h>
 #include <ESP32Encoder.h>
 #include <Button2.h>
+#include <Preferences.h>
 #include <driver/gpio.h>
 #include <soc/gpio_struct.h>
 #include <esp_timer.h>
+#include <esp_cpu.h>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <soc/soc_caps.h>
+
+// ──────────────────────────────────────────────
+//  ESP32-S3 SHIMS
+// ──────────────────────────────────────────────
+#if !SOC_DAC_SUPPORTED
+// No DAC on this chip: analog files are refused before they load (see
+// openSignalFile), so the analog code below never runs. These keep it
+// compiling unchanged. Macros and not functions: the IDE writes its function
+// prototypes above the first function it finds, which here would land before
+// the types they use.
+#define dacWrite(pin, value) ((void)(pin), (void)(value))
+#define dacDisable(pin)      ((void)(pin))
+#endif
+
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+// With "USB CDC On Boot" `Serial` is the native USB port only. This console
+// writes to both connectors (native USB and the UART bridge) and reads from
+// whichever has data, so the board answers wherever it is plugged in. Every
+// `Serial.` below goes through it.
+class DualConsole : public Stream {
+public:
+  void begin(unsigned long baud) { HWCDCSerial.begin(baud); Serial0.begin(baud); }
+  int available() override { return HWCDCSerial.available() + Serial0.available(); }
+  int read() override { return HWCDCSerial.available() ? HWCDCSerial.read() : Serial0.read(); }
+  int peek() override { return HWCDCSerial.available() ? HWCDCSerial.peek() : Serial0.peek(); }
+  void flush() override { HWCDCSerial.flush(); Serial0.flush(); }
+  size_t write(uint8_t b) override { HWCDCSerial.write(b); return Serial0.write(b); }
+  size_t write(const uint8_t *buf, size_t n) override { HWCDCSerial.write(buf, n); return Serial0.write(buf, n); }
+};
+static DualConsole dualConsole;
+#undef Serial
+#define Serial dualConsole
+#endif
 
 // ──────────────────────────────────────────────
 //  PIN CONFIGURATION
 // ──────────────────────────────────────────────
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+// ESP32-S3: GPIO 22-25 and 32-37 are not usable, so everything moves. Avoided
+// on purpose: strapping pins (0, 3, 45, 46), native USB (19, 20), UART (43,
+// 44) and the RGB LED of the dev boards (38, 48). The microSD uses the default
+// SPI pins (SCK 12, MOSI 11, MISO 13) and the OLED the default I2C pins
+// (SDA 8, SCL 9).
+#define ENCODER_PIN_A    4
+#define ENCODER_PIN_B    5
+#define ENCODER_BTN_PIN  6
+
+#define SD_CS_PIN       10   // SD card CS pin
+
+// Signal output pins (one per channel: CKP, CMP, CMP2, CMP3)
+#define NUM_CHANNELS     4
+#define SIG_PIN_CH0     15   // CKP
+#define SIG_PIN_CH1     16   // CMP
+#define SIG_PIN_CH2     17   // CMP 2
+#define SIG_PIN_CH3     18   // CMP 3
+#else
 #define ENCODER_PIN_A   32
 #define ENCODER_PIN_B   33
 #define ENCODER_BTN_PIN  4   // GPIO 25 is left free: it is DAC1 (analog channel 2)
@@ -63,6 +148,7 @@
 #define SIG_PIN_CH1     27   // CMP
 #define SIG_PIN_CH2     14   // CMP 2
 #define SIG_PIN_CH3     12   // CMP 3
+#endif
 
 static const gpio_num_t sigPins[NUM_CHANNELS] = {
   (gpio_num_t)SIG_PIN_CH0,
@@ -93,7 +179,6 @@ static const uint8_t anaPins[2] = { ANA_PIN_CH0, ANA_PIN_CH1 };
 // than ANA_MAX_SAMPLES per channel (8-bit DAC values, 8 KB per channel).
 #define ANA_MAX_SPP      32
 #define ANA_MAX_SAMPLES  8192
-#define DAC_FULL_SCALE_V 3.3f
 
 // I2C OLED (SSD1306 128x64) – default SDA=21, SCL=22
 // If your board uses different pins, change the constructor below.
@@ -106,96 +191,6 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 ESP32Encoder encoder;
 Button2 button;
-
-#define LOGO_WIDTH  128
-#define LOGO_HEIGHT  64
-static const unsigned char logo_bitmap[] U8X8_PROGMEM = {
-
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0xFF, 0xFF, 0x0F, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF,
-  0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0xFF,
-  0xFF, 0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xF8, 0x1F, 0x00, 0x00, 0xF8, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x07, 0x00, 0x00, 0xE0, 0x1F, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x01, 0x00,
-  0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xFE, 0x01, 0x00, 0x00, 0x80, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x80, 0xF7,
-  0xD7, 0x01, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x7F, 0xE0, 0xFF, 0xFF, 0x07, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0xF0, 0xFF, 0xFF, 0x07, 0xFE, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xF0, 0xFF,
-  0xFF, 0x07, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x80, 0x3F, 0xF8, 0xFF, 0xFF, 0x07, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xF8, 0xFF, 0xFF, 0x01, 0xFF, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F, 0xF8, 0xFF,
-  0x07, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x3F, 0xF0, 0xFF, 0x0F, 0x80, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xF0, 0xFF, 0x1F, 0xC0, 0xFF, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0xE0, 0xFF,
-  0x3F, 0xE0, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x7F, 0x00, 0xBE, 0x3F, 0xE0, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x00, 0x00, 0x7C, 0xE0, 0x7F, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x00,
-  0xFC, 0xC0, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xFC, 0x03, 0x00, 0xF8, 0x81, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x07, 0x00, 0xF0, 0x03, 0x1F, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x1F, 0x00,
-  0xE0, 0x03, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0x03, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0xFF,
-  0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0xFC, 0xFF, 0xFF, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x99, 0x99, 0x02, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x1C, 0x08, 0x1F, 0x3C, 0x3E, 0x3E, 0x84, 0x3C, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x7F, 0x8C, 0x3F, 0xFE, 0xFE, 0x7F, 0x8C, 0xFF,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x9E, 0x31, 0xC6,
-  0x06, 0x63, 0xCE, 0xC6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x03, 0x9E, 0x3F, 0xFE, 0x7F, 0x7F, 0x9F, 0xFF, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x03, 0xB7, 0x1F, 0x7E, 0x3E, 0x3F, 0xDF, 0x7E,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE7, 0xBF, 0x19, 0x76,
-  0x16, 0x83, 0xBF, 0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0xBE, 0xF7, 0x39, 0xE6, 0xFF, 0x83, 0xF5, 0xE3, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x14, 0x80, 0x20, 0x00, 0x18, 0x80, 0x80, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00,
-};
 
 // ──────────────────────────────────────────────
 //  ICONS 12x12 pixels (XBM format, stored in bytes)
@@ -241,7 +236,7 @@ enum AppState {
   STATE_SPLASH,
   STATE_BROWSER,
   STATE_VIEW_FILE,
-  STATE_SIG_CONFIG,    // configure cycles before playback
+  STATE_UNIT_SELECT,   // file loaded: pick the speed unit, then play
   STATE_PLAYING        // signal generation running (RPM adjustable)
 };
 
@@ -292,15 +287,98 @@ int totalFileLines = 0;
 // Files only contain rows where a channel changes.
 // Each "event" stores the channel values and how long (in step-fractions)
 // to hold those values before the next change.
+// Channels read from a digital file: the 16 that Oryx can design. Only the
+// first NUM_CHANNELS have a pin; the rest travel in `extra`.
+#define MAX_FILE_CHANNELS 16
+
 struct SignalEvent {
-  float   stepF;                  // absolute step position from file (fractional)
-  float   durationF;              // duration in steps (next_step - this_step), fractional
-  uint8_t val[NUM_CHANNELS];     // channel values (0|1)
+  float    stepF;                 // absolute step position from file (fractional)
+  float    durationF;             // duration in steps (next_step - this_step), fractional
+  uint8_t  val[NUM_CHANNELS];     // channel values (0|1)
+  uint16_t extra;                 // channels 5..16, bit 0 = channel 5 (no pin)
+};
+
+// Reads a file in big blocks and hands out one line at a time, without a
+// String per line: what makes a file with millions of rows readable in
+// reasonable time. Only member functions, so the IDE's prototypes are fine.
+class BlockReader {
+public:
+  File     f;
+  uint8_t *buf = nullptr;
+  size_t   cap = 0;
+  size_t   len = 0;
+  size_t   pos = 0;
+  uint32_t bufStart = 0;   // file offset of buf[0]
+
+  bool open(const String &path, size_t size) {
+    f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    buf = (uint8_t *)malloc(size);
+    if (!buf) { f.close(); return false; }
+    cap = size; len = pos = 0; bufStart = 0;
+    return true;
+  }
+  void close() {
+    if (f) f.close();
+    if (buf) { free(buf); buf = nullptr; }
+  }
+  uint32_t size() { return f ? (uint32_t)f.size() : 0; }
+  // Offset of the next unread byte
+  uint32_t tell() { return bufStart + pos; }
+  void seek(uint32_t off) {
+    f.seek(off);
+    bufStart = off; len = pos = 0;
+  }
+  // Copies the next line into `out` (no \r, no \n). Returns its length,
+  // or -1 at the end of the file. Overlong lines are cut, never overflow.
+  int readLine(char *out, int maxLen) {
+    int n = 0;
+    bool any = false;
+    while (true) {
+      if (pos >= len) {
+        bufStart += len;
+        len = f.read(buf, cap);
+        pos = 0;
+        if (len == 0) break;
+      }
+      char c = (char)buf[pos++];
+      any = true;
+      if (c == '\n') break;
+      if (c == '\r') continue;
+      if (n < maxLen - 1) out[n++] = c;
+    }
+    out[n] = 0;
+    return any ? n : -1;
+  }
+};
+
+// What one read of a digital file tells (see scanSignalFile).
+// Steps are doubles: past 4 million a float cannot tell fractions of a step
+// apart (it resolves half a step), and files that long are what streaming is
+// for. Durations are taken as double differences and only then made float.
+struct ScanInfo {
+  uint32_t rows;        // data rows, end marker included
+  double   firstStep;
+  double   lastStep;
+  uint16_t firstBits;   // bit c = channel c (all 16)
+  uint16_t lastBits;
+  double   gridStep;    // smallest gap between rows
+  int      channels;
+  uint32_t dataStart;   // file offset right after the header line
+  uint32_t size;
+};
+
+// One event of the streaming ring buffer: 8 bytes.
+struct StreamEvt {
+  float    dur;         // steps it holds
+  uint16_t bits;        // bit c = channel c
+  uint16_t flags;       // bit 0: first event of a pass of the signal
 };
 
 std::vector<SignalEvent> signalEvents;   // parsed event list
 float  signalTotalStepsF = 0;            // total step-duration of one cycle (fractional)
 int    signalTotalEvents = 0;            // number of events (transitions)
+int    fileChannels      = 0;            // channel columns in the loaded digital file
 String signalFileName    = "";
 String signalFilePath    = "";
 
@@ -347,8 +425,7 @@ struct AnaSeg {
 };
 
 // Metadata extracted from signal file (optional, 0 if missing)
-float   metaVoltage    = 0.0f;   // VOLTAGE:
-int     metaCycles     = 0;      // CYCLES: (crankshaft revolutions per file playback)
+float   metaVoltage    = 0.0f;   // VOLTAGE: read only, nothing uses it (yours to use)
 int     metaRPM        = 0;      // RPM: start speed (0 = keep the current one)
 float   metaStepTime   = 0.0f;   // STEP_TIME: per-step microseconds the file was authored with (diagnostic)
 int     metaResolution = 0;      // RESOLUTION (bits): analog files only
@@ -362,14 +439,41 @@ volatile uint32_t currentRPM = 800;  // default 800 RPM
 #define RPM_MAX       8000
 #define RPM_STEP      100            // encoder step size
 
-// Crankshaft revolutions contained in one file playback.
-// From CYCLES metadata if present, otherwise user-adjustable.
-#define CYCLES_DEFAULT 2
-#define CYCLES_MIN     1
-#define CYCLES_MAX     8
-uint8_t signalCycles = CYCLES_DEFAULT;
+// Speed unit. RPM keeps the verified formula above; the other three give the
+// step time straight away, without needing the file's step count.
+#define UNIT_US   0
+#define UNIT_RPM  1
+#define UNIT_BPS  2
+#define UNIT_HZ   3
+#define UNIT_COUNT 4
+static const char *UNIT_NAMES[UNIT_COUNT] = { "us", "rpm", "bps", "hz" };
+static const char *UNIT_LABELS[UNIT_COUNT] = { "us/step", "RPM", "bps", "Hz" };
+static const float UNIT_MIN[UNIT_COUNT] = { 2.5f,       RPM_MIN, 1.0f,      0.5f };
+static const float UNIT_MAX[UNIT_COUNT] = { 1000000.0f, RPM_MAX, 400000.0f, 200000.0f };
+uint8_t speedUnit  = UNIT_RPM;   // the last one used, restored from NVS at boot
+// Unit highlighted on the unit selection screen
+uint8_t unitCursor = UNIT_RPM;
+// Start speed the open file asks for, in µs/step (0 = the file has none)
+float   fileStartUs = 0.0f;
+// The last unit is kept in NVS so it is preselected after a power cycle
+Preferences prefs;
+// Value in the current unit when it is not RPM (RPM lives in currentRPM).
+float   speedValue = 1000.0f;
 
-// Per-step duration in microseconds (computed from RPM, not user-set directly).
+// The speed is shown with a fixed number of digits per unit, so every digit
+// keeps its place on screen while it is edited ("0001000.00 us/step").
+static const uint8_t UNIT_INT_DIGITS[UNIT_COUNT] = { 7, 4, 6, 6 };   // us, rpm, bps, hz
+static const uint8_t UNIT_DECIMALS[UNIT_COUNT]   = { 2, 0, 0, 2 };
+
+// Playing screen cursor: 0..digits-1 are the digits (left to right), then
+// the unit label, then the Pause/Resume button.
+uint8_t  playCursor   = 0;
+bool     editingDigit = false;   // the digit under the cursor blinks and the encoder changes it
+bool     blinkOn      = true;
+uint32_t blinkAt      = 0;
+#define BLINK_MS 350
+
+// Per-step duration in microseconds (computed from the speed, not user-set directly).
 // Kept as float so the sub-microsecond fraction is preserved — truncating it to
 // an integer biased every step short, making playback a few µs/pulse too fast.
 volatile float tickUs = 1000.0f;
@@ -379,6 +483,8 @@ volatile bool     isPlaying        = false;
 volatile bool     isPaused         = false;   // short-click toggles this during playback
 volatile uint32_t playbackStep     = 0;
 volatile uint32_t loopCount        = 0;     // completed signal cycles
+bool              streamMode       = false; // the loaded file plays from the card (too big for RAM)
+volatile uint32_t underruns        = 0;     // times the card fell behind while streaming
 
 // ──────────────────────────────────────────────
 //  ENCODER STATE
@@ -420,6 +526,7 @@ void goBack();
 void handleEncoder();
 void onButtonClick(Button2 &btn);
 void onButtonLongClick(Button2 &btn);
+void onButtonDoubleClick(Button2 &btn);
 void drawSplash();
 void readFileContent(const String &path);
 String truncateString(const String &str, int maxPixels);
@@ -432,7 +539,6 @@ bool isAnalogFile(const String &path);
 bool parseMetaLine(const String &line);
 bool parseSignalFile(const String &path);
 bool parseAnalogFile(const String &path);
-void drawSigConfig();
 void drawPlaying();
 void startPlayback();
 void stopPlayback();
@@ -440,9 +546,21 @@ void freeSigBuffers();
 void freeAnaBuffers();
 void recalcTickFromRPM();
 void stepRPM(int ticks);
+void recalcTick();
+void stepSpeed(int ticks);
+void setSpeedUnit(uint8_t unit);
+uint8_t speedDigitCount();
+String speedDigits();
+void editSpeedDigit(int dir);
+void resetPlayCursor();
+void setSpeedFromUs(uint8_t unit, float us);
+void saveSpeedUnit();
+void drawUnitSelect();
+void playWithUnit(uint8_t unit);
+String speedLabel();
 String modeLabel();
 String stripExtension(const String &name);
-bool openSignalFile(const String &path, const String &name, bool autoStart);
+bool openSignalFile(const String &path, const String &name, bool askUnit);
 // OLED detection + serial console
 bool detectOled();
 void serialPoll();
@@ -497,10 +615,17 @@ void setup() {
   encoder.setCount(0);
   lastEncoderCount = 0;
 
+  // ── Last speed unit ──
+  prefs.begin("oryx-sd", false);
+  speedUnit = prefs.getUChar("unit", UNIT_RPM);
+  if (speedUnit >= UNIT_COUNT) speedUnit = UNIT_RPM;
+  unitCursor = speedUnit;
+
   // ── Button ──
   button.begin(ENCODER_BTN_PIN, INPUT_PULLUP, true);   // active LOW
   button.setClickHandler(onButtonClick);
   button.setLongClickDetectedHandler(onButtonLongClick);
+  button.setDoubleClickHandler(onButtonDoubleClick);
   button.setLongClickTime(600);
 
   // ── Load root directory ──
@@ -514,6 +639,10 @@ void setup() {
 //  LOOP
 // ──────────────────────────────────────────────
 void loop() {
+  // While a big file streams, give the card reader core 1 between passes
+  // (it runs at this same priority; see startStreaming)
+  if (streamMode && isPlaying) vTaskDelay(1);
+
   button.loop();
   serialPoll();
 
@@ -542,24 +671,44 @@ void loop() {
       if (updateHeaderScroll()) drawFileViewer();
       break;
 
-    case STATE_SIG_CONFIG:
+    case STATE_UNIT_SELECT:
       handleEncoder();
       break;
 
-    case STATE_PLAYING:
-      // Allow RPM changes mid-generation via encoder
+    case STATE_PLAYING: {
+      // Speed changes mid-generation via encoder, digit by digit
       handleEncoder();
+      // The "SD too slow" title shows up once, when the first gap happens
+      static uint32_t shownUnderruns = 0;
+      if (streamMode && (underruns > 0) != (shownUnderruns > 0)) {
+        shownUnderruns = underruns;
+        drawPlaying();
+      }
+      // The digit being edited blinks (only then is the screen redrawn on its own)
+      if (editingDigit && millis() - blinkAt >= BLINK_MS) {
+        blinkOn = !blinkOn;
+        blinkAt = millis();
+        drawPlaying();
+      }
       break;
+    }
   }
 }
 
 // ──────────────────────────────────────────────
 //  SPLASH SCREEN
 // ──────────────────────────────────────────────
+// Two centered lines: the name and, a bit smaller, what this sketch is.
 void drawSplash() {
   if (!oledPresent) return;
   u8g2.clearBuffer();
-  u8g2.drawXBMP(0, 0, LOGO_WIDTH, LOGO_HEIGHT, logo_bitmap);
+  u8g2.setDrawColor(1);
+  const char *title = "Oryx Signal Studio";
+  u8g2.setFont(u8g2_font_7x13B_tr);           // 7 px per letter: fits the 128 px width
+  u8g2.drawStr(64 - u8g2.getStrWidth(title) / 2, 30, title);
+  const char *subtitle = "TEST CODE";
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(64 - u8g2.getStrWidth(subtitle) / 2, 46, subtitle);
   u8g2.sendBuffer();
 }
 
@@ -760,9 +909,134 @@ void stepRPM(int ticks) {
   }
 }
 
+// Step time from the current speed. RPM goes through the verified formula
+// untouched; the other units do not depend on the file's step count.
+void recalcTick() {
+  if (speedUnit == UNIT_RPM) { recalcTickFromRPM(); return; }
+  float t;
+  if (speedUnit == UNIT_US)       t = speedValue;
+  else if (speedUnit == UNIT_BPS) t = 1000000.0f / speedValue;
+  else                            t = 1000000.0f / (2.0f * speedValue);
+  if (t < 0.001f) t = 0.001f;
+  tickUs = t;
+}
+
+// About 10 % of the value per detent, so the knob is useful from 5 µs to
+// a million. RPM keeps its fixed RPM_STEP.
+static float smartStep(float v, float minStep) {
+  float mag = floorf(log10f(v > 1.0f ? v : 1.0f));
+  float st = powf(10.0f, mag - 1.0f);
+  return st < minStep ? minStep : st;
+}
+
+void stepSpeed(int ticks) {
+  if (speedUnit == UNIT_RPM) { stepRPM(ticks); recalcTick(); return; }
+  float minStep = speedUnit == UNIT_HZ ? 0.5f : 1.0f;
+  float v = speedValue + (ticks > 0 ? 1 : -1) * smartStep(speedValue, minStep);
+  if (v < UNIT_MIN[speedUnit]) v = UNIT_MIN[speedUnit];
+  if (v > UNIT_MAX[speedUnit]) v = UNIT_MAX[speedUnit];
+  speedValue = v;
+  recalcTick();
+}
+
+// Another unit at the same speed: the number changes, the signal does not.
+// Going to RPM needs the file's step count; without a file the RPM is kept.
+void setSpeedUnit(uint8_t unit) {
+  if (unit >= UNIT_COUNT || unit == speedUnit) return;
+  setSpeedFromUs(unit, tickUs);
+}
+
+// Sets a speed given in µs/step, expressed in `unit`. Going to RPM needs the
+// file's step count; without a file the RPM is kept.
+void setSpeedFromUs(uint8_t unit, float us) {
+  if (unit >= UNIT_COUNT) return;
+  if (us > 0.0f) {
+    if (unit == UNIT_RPM) {
+      if (signalTotalStepsF > 1e-3f) {
+        long rpm = lroundf(60000000.0f / (us * signalTotalStepsF));
+        if (rpm < RPM_MIN) rpm = RPM_MIN;
+        if (rpm > RPM_MAX) rpm = RPM_MAX;
+        currentRPM = (uint32_t)rpm;
+      }
+    } else {
+      float v = unit == UNIT_US  ? us
+              : unit == UNIT_BPS ? 1000000.0f / us
+              :                    1000000.0f / (2.0f * us);
+      if (v < UNIT_MIN[unit]) v = UNIT_MIN[unit];
+      if (v > UNIT_MAX[unit]) v = UNIT_MAX[unit];
+      speedValue = v;
+    }
+  }
+  speedUnit = unit;
+  recalcTick();
+}
+
+// Remembers the unit for the next file and the next power-up.
+void saveSpeedUnit() {
+  prefs.putUChar("unit", speedUnit);
+}
+
+// How many editable digits the current unit has.
+uint8_t speedDigitCount() {
+  return UNIT_INT_DIGITS[speedUnit] + UNIT_DECIMALS[speedUnit];
+}
+
+// The current speed with its fixed width: "0001000.00", "0800", "009600".
+String speedDigits() {
+  uint8_t dec = UNIT_DECIMALS[speedUnit];
+  int width = UNIT_INT_DIGITS[speedUnit] + (dec ? dec + 1 : 0);
+  float v = speedUnit == UNIT_RPM ? (float)currentRPM : speedValue;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%0*.*f", width, dec, v);
+  return String(buf);
+}
+
+// Adds or takes one from the digit under the cursor (with carry), within the
+// unit's limits. Applied live: the signal task reads tickUs on the fly.
+void editSpeedDigit(int dir) {
+  uint8_t ints = UNIT_INT_DIGITS[speedUnit];
+  float place = playCursor < ints ? powf(10.0f, (float)(ints - 1 - playCursor))
+                                  : powf(10.0f, -(float)(playCursor - ints + 1));
+  if (speedUnit == UNIT_RPM) {
+    long rpm = (long)currentRPM + dir * (long)place;
+    if (rpm < RPM_MIN) rpm = RPM_MIN;
+    if (rpm > RPM_MAX) rpm = RPM_MAX;
+    currentRPM = (uint32_t)rpm;
+  } else {
+    float v = speedValue + dir * place;
+    if (v < UNIT_MIN[speedUnit]) v = UNIT_MIN[speedUnit];
+    if (v > UNIT_MAX[speedUnit]) v = UNIT_MAX[speedUnit];
+    float scale = powf(10.0f, (float)UNIT_DECIMALS[speedUnit]);
+    speedValue = roundf(v * scale) / scale;   // no float crumbs from adding 0.01
+  }
+  recalcTick();
+}
+
+// Cursor on the first significant digit, nothing being edited.
+void resetPlayCursor() {
+  String d = speedDigits();
+  uint8_t ints = UNIT_INT_DIGITS[speedUnit];
+  playCursor = ints - 1;   // the units digit, if every other one is zero
+  for (uint8_t i = 0; i < ints; i++) {
+    if (d.charAt(i) != '0') { playCursor = i; break; }
+  }
+  editingDigit = false;
+  blinkOn = true;
+}
+
+// "800 RPM", "1000.00 us/step", "9600 bps", "100000.00 Hz"
+String speedLabel() {
+  if (speedUnit == UNIT_RPM) return String(currentRPM) + " RPM";
+  int decimals = speedUnit == UNIT_BPS ? 0 : 2;
+  return String(speedValue, decimals) + " " + UNIT_LABELS[speedUnit];
+}
+
 // "Digital 4ch" / "Analog 1ch" — shown under the RPM.
 String modeLabel() {
   if (signalMode == MODE_ANALOG) return "Analog " + String(anaChannels) + "ch";
+  if (fileChannels > NUM_CHANNELS) {
+    return "Digital " + String(NUM_CHANNELS) + "ch +" + String(fileChannels - NUM_CHANNELS) + " data";
+  }
   return "Digital " + String(NUM_CHANNELS) + "ch";
 }
 
@@ -860,11 +1134,14 @@ void readFileContent(const String &path) {
     return;
   }
 
-  while (f.available()) {
+  // Only the first lines: a big file would not fit in RAM as Strings
+  const int VIEW_MAX_LINES = 300;
+  while (f.available() && (int)fileLines.size() < VIEW_MAX_LINES) {
     String line = f.readStringUntil('\n');
     line.trim();
     fileLines.push_back(line);
   }
+  if (f.available()) fileLines.push_back("... (first " + String(VIEW_MAX_LINES) + " lines)");
   f.close();
   totalFileLines = (int)fileLines.size();
   if (totalFileLines == 0) {
@@ -928,7 +1205,6 @@ void drawFileViewer() {
 // The exporter writes metadata at the end of the file, after a blank line:
 //   VOLTAGE: 5
 //   STEP_TIME (us): 1000
-//   CYCLES: 2
 //   RPM: 800
 //   RESOLUTION (bits): 12        ← analog files only
 // Returns true if the line was a metadata line (and consumed).
@@ -952,9 +1228,7 @@ bool parseMetaLine(const String &line) {
     return true;
   }
   if (line.startsWith("CYCLES")) {
-    metaCycles = val.toInt();
-    Serial.printf("[SIG] Metadata CYCLES: %d\n", metaCycles);
-    return true;
+    return true;   // older exports: no longer used
   }
   if (line.startsWith("RPM")) {
     metaRPM = val.toInt();
@@ -970,10 +1244,17 @@ bool parseMetaLine(const String &line) {
 }
 
 // Analog exports always carry "RESOLUTION (bits)"; digital ones never do.
+// Only analog files carry "RESOLUTION (bits)", and it is in the metadata at
+// the end: reading the last 4 KB is enough, instead of the whole file (which
+// took minutes on a file with millions of rows).
 bool isAnalogFile(const String &path) {
   File f = SD.open(path, FILE_READ);
   if (!f) return false;
+  uint32_t size = f.size();
+  uint32_t from = size > 4096 ? size - 4096 : 0;
+  f.seek(from);
   bool analog = false;
+  if (from > 0) f.readStringUntil('\n');   // first line may be cut in half
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -981,6 +1262,104 @@ bool isAnalogFile(const String &path) {
   }
   f.close();
   return analog;
+}
+
+// One data row, without Strings: step, then up to 16 channel columns (any
+// value other than 0 is high, same as the in-memory parser). False if there
+// is no channel column.
+bool parseRowFast(const char *line, double *step, uint16_t *bits, int *cols) {
+  char *end;
+  *step = strtod(line, &end);
+  if (end == line) return false;
+  const char *p = end;
+  uint16_t b = 0;
+  int c = 0;
+  while (*p && c < MAX_FILE_CHANNELS) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) break;
+    long v = strtol(p, &end, 10);
+    if (end == p) {                 // not a number ('-'): low, skip the token
+      while (*p && *p != ' ' && *p != '\t') p++;
+    } else {
+      p = end;
+      while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    if (v != 0) b |= (uint16_t)(1u << c);
+    c++;
+  }
+  *bits = b;
+  *cols = c;
+  return c > 0;
+}
+
+// Reads a digital file once, in blocks: metadata, how many rows, first and
+// last step, and whether the last row is an end-of-cycle marker. Shows the
+// progress, since a big file takes a while.
+bool scanSignalFile(const String &path, ScanInfo *info) {
+  BlockReader r;
+  if (!r.open(path, 8192)) {
+    Serial.println(F("[SIG] Cannot open file"));
+    return false;
+  }
+  metaVoltage = 0.0f; metaRPM = 0; metaStepTime = 0.0f; metaResolution = 0;
+  memset(info, 0, sizeof(*info));
+  info->size = r.size();
+  info->gridStep = 1.0f;
+
+  static char line[256];
+  r.readLine(line, sizeof(line));          // header (column names)
+  info->dataStart = r.tell();
+
+  double minDiff = 1e30;
+  double prevStep = 0.0;
+  int    lastPct = -1;
+  while (true) {
+    int n = r.readLine(line, sizeof(line));
+    if (n < 0) break;
+    if (n == 0) continue;
+    if (!isDigit(line[0])) {
+      // Metadata (and the credit line, which has no ':')
+      String m(line);
+      m.trim();
+      parseMetaLine(m);
+      continue;
+    }
+    double st; uint16_t bits; int cols;
+    if (!parseRowFast(line, &st, &bits, &cols)) continue;
+    if (info->rows == 0) { info->firstStep = st; info->firstBits = bits; }
+    else {
+      double d = st - prevStep;
+      if (d > 1e-6 && d < minDiff) minDiff = d;
+    }
+    prevStep = st;
+    info->lastStep = st;
+    info->lastBits = bits;
+    if (cols > info->channels) info->channels = cols;
+    info->rows++;
+
+    if ((info->rows & 0x3FFF) == 0) {
+      int pct = info->size ? (int)((uint64_t)r.tell() * 100 / info->size) : 0;
+      if (pct != lastPct) {
+        lastPct = pct;
+        Serial.printf("[SIG] Reading %d%% (%u rows)\n", pct, (unsigned)info->rows);
+        if (oledPresent) {
+          u8g2.clearBuffer();
+          u8g2.setFont(u8g2_font_6x10_tr);
+          String a = "Reading " + String(pct) + "%";
+          String b = String(info->rows) + " rows";
+          u8g2.drawStr(64 - u8g2.getStrWidth(a.c_str()) / 2, 28, a.c_str());
+          u8g2.drawStr(64 - u8g2.getStrWidth(b.c_str()) / 2, 42, b.c_str());
+          u8g2.sendBuffer();
+        }
+      }
+    }
+  }
+  r.close();
+  if (minDiff < 1e29) info->gridStep = minDiff;
+  if (info->channels > MAX_FILE_CHANNELS) info->channels = MAX_FILE_CHANNELS;
+  Serial.printf("[SIG] %u rows, %d channels, steps %.4f..%.4f\n",
+                (unsigned)info->rows, info->channels, info->firstStep, info->lastStep);
+  return info->rows > 0;
 }
 
 // ──────────────────────────────────────────────
@@ -1015,19 +1394,20 @@ bool parseSignalFile(const String &path) {
 
   // Read all data rows into a temporary list (float step + values)
   struct RawEvent {
-    float   stepF;               // original fractional step from file
-    uint8_t val[NUM_CHANNELS];
+    double   stepF;              // original fractional step from file (double: see ScanInfo)
+    uint8_t  val[NUM_CHANNELS];
+    uint16_t extra;              // channels 5..16
   };
   std::vector<RawEvent> rawEvents;
 
   // Reset metadata to defaults
   metaVoltage    = 0.0f;
-  metaCycles     = 0;
   metaRPM        = 0;
   metaStepTime   = 0.0f;
   metaResolution = 0;
 
   int skippedLines = 0;
+  fileChannels = 0;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -1036,12 +1416,17 @@ bool parseSignalFile(const String &path) {
     // ── Check for metadata lines ──
     if (parseMetaLine(line)) continue;
 
+    // Data rows start with their step number. Anything else — such as the
+    // "Generated with Oryx" credit line at the end of the file — is not a row.
+    if (!isDigit(line.charAt(0))) continue;
+
     // ── Tokenize by TAB or consecutive spaces ──
-    String fields[10];
+    // Step + up to MAX_FILE_CHANNELS channel columns
+    String fields[MAX_FILE_CHANNELS + 1];
     int fieldCount = 0;
     int len = line.length();
     int i = 0;
-    while (i < len && fieldCount < 10) {
+    while (i < len && fieldCount < MAX_FILE_CHANNELS + 1) {
       while (i < len && (line.charAt(i) == ' ' || line.charAt(i) == '\t')) i++;
       if (i >= len) break;
       int start = i;
@@ -1065,10 +1450,16 @@ bool parseSignalFile(const String &path) {
     }
 
     RawEvent ev;
-    ev.stepF = fields[0].toFloat();   // parse as float to preserve fractions
+    ev.stepF = strtod(fields[0].c_str(), nullptr);   // double, to keep fractions on long signals
     for (int c = 0; c < NUM_CHANNELS; c++) {
       ev.val[c] = ((c + 1) < fieldCount && fields[c + 1].toInt() != 0) ? 1 : 0;
     }
+    // Channels past the pins: only kept, see writeExtraChannels()
+    ev.extra = 0;
+    for (int c = NUM_CHANNELS; c < fieldCount - 1; c++) {
+      if (fields[c + 1].toInt() != 0) ev.extra |= (uint16_t)(1u << (c - NUM_CHANNELS));
+    }
+    if (fieldCount - 1 > fileChannels) fileChannels = fieldCount - 1;
     rawEvents.push_back(ev);
   }
   f.close();
@@ -1099,17 +1490,20 @@ bool parseSignalFile(const String &path) {
   for (int c = 0; c < NUM_CHANNELS && hasEndMarker; c++) {
     if (rawEvents[numRaw - 1].val[c] != rawEvents[0].val[c]) hasEndMarker = false;
   }
+  // With more than 4 channels the marker has to match on those too (on a
+  // 4-channel file `extra` is always 0, so nothing changes there).
+  if (hasEndMarker && rawEvents[numRaw - 1].extra != rawEvents[0].extra) hasEndMarker = false;
 
   // Finest grid step — used only as the last-event duration when no wrap marker
   // is present (the period is then unknown and this is the best estimate).
   float gridStep = 1.0f;
   {
-    float minDiff = 1e30f;
+    double minDiff = 1e30;
     for (int i = 1; i < numRaw; i++) {
-      float d = rawEvents[i].stepF - rawEvents[i - 1].stepF;
-      if (d > 1e-6f && d < minDiff) minDiff = d;
+      double d = rawEvents[i].stepF - rawEvents[i - 1].stepF;
+      if (d > 1e-6 && d < minDiff) minDiff = d;
     }
-    if (minDiff < 1e29f) gridStep = minDiff;
+    if (minDiff < 1e29) gridStep = (float)minDiff;
   }
 
   // Number of real (playable) events: drop the trailing marker row if present.
@@ -1117,16 +1511,17 @@ bool parseSignalFile(const String &path) {
 
   for (int i = 0; i < numEvents; i++) {
     SignalEvent se;
-    se.stepF = rawEvents[i].stepF;
+    se.stepF = (float)rawEvents[i].stepF;
     for (int c = 0; c < NUM_CHANNELS; c++) {
       se.val[c] = rawEvents[i].val[c];
     }
+    se.extra = rawEvents[i].extra;
 
     if (i < numRaw - 1) {
       // Duration in steps (fractional) = next step position - this step position.
       // For the last real event with a marker, rawEvents[i + 1] IS the marker,
       // so this yields the correct wrap duration.
-      se.durationF = rawEvents[i + 1].stepF - rawEvents[i].stepF;
+      se.durationF = (float)(rawEvents[i + 1].stepF - rawEvents[i].stepF);
     } else {
       // No end marker: period unknown, assume one grid step until the wrap.
       se.durationF = gridStep;
@@ -1150,7 +1545,7 @@ bool parseSignalFile(const String &path) {
   // ~1/(steps) too short — e.g. 150 vs 149 steps ≈ 5 us/pulse fast at 500 RPM.
   // For a file WITH an end marker, rawEvents.back() is the marker, so this still
   // yields markerStep − firstStep (unchanged from before).
-  signalTotalStepsF = rawEvents.back().stepF - rawEvents.front().stepF;
+  signalTotalStepsF = (float)(rawEvents.back().stepF - rawEvents.front().stepF);
   if (signalTotalStepsF < 1e-3f) {
     // Degenerate (single row or all-equal steps): fall back to summed durations.
     signalTotalStepsF = 0.0f;
@@ -1160,6 +1555,10 @@ bool parseSignalFile(const String &path) {
   // Debug output
   Serial.printf("[SIG] Parsed %d events, %.2f total steps per cycle\n",
                 signalTotalEvents, signalTotalStepsF);
+  if (fileChannels > NUM_CHANNELS) {
+    Serial.printf("[SIG] %d channels in the file: 1-%d go out on pins, %d-%d are kept for writeExtraChannels()\n",
+                  fileChannels, NUM_CHANNELS, NUM_CHANNELS + 1, fileChannels);
+  }
   for (int i = 0; i < signalTotalEvents && i < 30; i++) {
     Serial.printf("[SIG] Event %d: step=%.4f dur=%.6f vals=[%d %d %d %d]\n",
                   i, signalEvents[i].stepF, signalEvents[i].durationF,
@@ -1178,8 +1577,8 @@ bool parseSignalFile(const String &path) {
   }
 
   // Metadata summary
-  Serial.printf("[SIG] Metadata → VOLTAGE: %.2f, CYCLES: %d, RPM: %d\n",
-                metaVoltage, metaCycles, metaRPM);
+  Serial.printf("[SIG] Metadata → VOLTAGE: %.2f, RPM: %d\n",
+                metaVoltage, metaRPM);
 
   signalMode = MODE_DIGITAL;
   return (signalTotalEvents > 0);
@@ -1375,7 +1774,6 @@ bool parseAnalogFile(const String &path) {
   }
 
   metaVoltage    = 0.0f;
-  metaCycles     = 0;
   metaRPM        = 0;
   metaStepTime   = 0.0f;
   metaResolution = 0;
@@ -1451,10 +1849,6 @@ bool parseAnalogFile(const String &path) {
   double want = span * ANA_MAX_SPP;
   anaCount = (uint32_t)min((double)ANA_MAX_SAMPLES, max(2.0, floor(want + 0.5)));
 
-  // Voltage scales the DAC's full range (3.3 V). No value, or one at or above
-  // 3.3 V (meant for an external stage), uses the full range.
-  double vScale = (metaVoltage > 0.0f && metaVoltage < DAC_FULL_SCALE_V)
-                  ? metaVoltage / DAC_FULL_SCALE_V : 1.0;
 
   for (uint8_t c = 0; c < anaChannels; c++) {
     anaSamples[c] = (uint8_t *)malloc(anaCount);
@@ -1516,7 +1910,7 @@ bool parseAnalogFile(const String &path) {
           y = pieceYAt(from, pieces[k], x);
         }
       }
-      double dac = clamp01d(y) * 255.0 * vScale;
+      double dac = clamp01d(y) * 255.0;
       anaSamples[c][i] = (uint8_t)(dac + 0.5);
     }
 
@@ -1530,49 +1924,9 @@ bool parseAnalogFile(const String &path) {
 
   Serial.printf("[ANA] Parsed %d segments, %.2f steps per cycle, %d bits, %.2f samples/step\n",
                 signalTotalEvents, signalTotalStepsF, bits, (double)anaCount / span);
-  Serial.printf("[ANA] Metadata → VOLTAGE: %.2f, CYCLES: %d, RPM: %d\n",
-                metaVoltage, metaCycles, metaRPM);
+  Serial.printf("[ANA] Metadata → VOLTAGE: %.2f, RPM: %d\n",
+                metaVoltage, metaRPM);
   return true;
-}
-
-// ──────────────────────────────────────────────
-//  DRAW SIGNAL CONFIGURATION SCREEN
-// ──────────────────────────────────────────────
-void drawSigConfig() {
-  if (!oledPresent) return;
-  u8g2.clearBuffer();
-
-  // Header: black background, white text with divider
-  u8g2.setFont(u8g2_font_5x7_tr);
-  u8g2.setDrawColor(1);
-  const char *title = "Signal Configuration";
-  int titleW = u8g2.getStrWidth(title);
-  u8g2.drawStr(64 - titleW / 2, 7, title);
-  u8g2.drawHLine(0, HEADER_H - 1, 128);
-
-  u8g2.setFont(u8g2_font_6x10_tr);
-
-  // Signal name (no extension), centered
-  String sigName = stripExtension(signalFileName);
-  sigName = truncateString(sigName, 124);
-  int nameW = u8g2.getStrWidth(sigName.c_str());
-  u8g2.drawStr(64 - nameW / 2, 26, sigName.c_str());
-
-  // Cycles selector (highlighted – encoder adjusts this)
-  String cycStr = "Cycles: " + String(signalCycles);
-  int cycW = u8g2.getStrWidth(cycStr.c_str());
-  int boxX = 64 - cycW / 2 - 4;
-  int boxW = cycW + 8;
-  u8g2.drawRFrame(boxX, 34, boxW, 14, 2);
-  u8g2.drawStr(64 - cycW / 2, 45, cycStr.c_str());
-
-  // Hint
-  u8g2.setFont(u8g2_font_5x7_tr);
-  const char *hint = "Click to start";
-  int hintW = u8g2.getStrWidth(hint);
-  u8g2.drawStr(64 - hintW / 2, 60, hint);
-
-  u8g2.sendBuffer();
 }
 
 // ──────────────────────────────────────────────
@@ -1585,7 +1939,9 @@ void drawPlaying() {
   // Header: black background, white text with divider
   u8g2.setFont(u8g2_font_5x7_tr);
   u8g2.setDrawColor(1);
+  // A streamed file the card cannot keep up with says so in the title
   const char *title = isPaused ? "Paused"
+                    : (streamMode && underruns > 0) ? "SD too slow: lower speed"
                     : (signalMode == MODE_ANALOG ? "Playing Analog" : "Playing Signal");
   int titleW = u8g2.getStrWidth(title);
   u8g2.drawStr(64 - titleW / 2, 7, title);
@@ -1599,25 +1955,51 @@ void drawPlaying() {
   int sigW = u8g2.getStrWidth(sigName.c_str());
   u8g2.drawStr(64 - sigW / 2, 22, sigName.c_str());
 
-  // RPM display — rounded frame, text centered
-  String rpmStr = String(currentRPM) + " RPM";
-  int rpmW = u8g2.getStrWidth(rpmStr.c_str());
-  int boxX = 64 - rpmW / 2 - 4;
-  int boxW = rpmW + 8;
-  u8g2.drawRFrame(boxX, 28, boxW, 14, 2);
-  u8g2.drawStr(64 - rpmW / 2, 39, rpmStr.c_str());
+  // Speed, digit by digit (the font is 6 px wide for every character). The
+  // digit under the cursor is underlined; while it is being edited it also
+  // blinks. Then the unit label, which is a cursor stop of its own.
+  String digits = speedDigits();
+  const char *unitTxt = UNIT_LABELS[speedUnit];
+  uint8_t ndig = speedDigitCount();
+  uint8_t ints = UNIT_INT_DIGITS[speedUnit];
+  if (playCursor > ndig + 1) playCursor = ndig + 1;   // the unit changed from serial
+  int totalW = (digits.length() + 1 + strlen(unitTxt)) * 6;
+  int x0 = 64 - totalW / 2;
+  const int yv = 38;
+  for (uint8_t i = 0; i < digits.length(); i++) {
+    int x = x0 + i * 6;
+    char ch = digits.charAt(i);
+    int d = ch == '.' ? -1 : (i < ints ? i : i - 1);   // digit index of this char
+    bool here = d >= 0 && d == playCursor;
+    if (!(here && editingDigit && !blinkOn)) {
+      char one[2] = { ch, 0 };
+      u8g2.drawStr(x, yv, one);
+    }
+    if (here) u8g2.drawHLine(x, yv + 2, 5);
+  }
+  int xu = x0 + (digits.length() + 1) * 6;
+  u8g2.drawStr(xu, yv, unitTxt);
+  if (playCursor == ndig) u8g2.drawRFrame(xu - 2, yv - 10, strlen(unitTxt) * 6 + 3, 13, 2);
 
-  // Cycles info centered
-  String cycStr = "Cycles: " + String(signalCycles);
-  int cycW = u8g2.getStrWidth(cycStr.c_str());
-  u8g2.drawStr(64 - cycW / 2, 52, cycStr.c_str());
+  // Pause / Resume, the last cursor stop
+  const char *pz = isPaused ? "Resume" : "Pause";
+  int pzW = u8g2.getStrWidth(pz);
+  if (playCursor == ndig + 1) {
+    u8g2.drawRBox(64 - pzW / 2 - 4, 43, pzW + 8, 12, 2);
+    u8g2.setDrawColor(0);
+  }
+  u8g2.drawStr(64 - pzW / 2, 53, pz);
+  u8g2.setDrawColor(1);
 
-  // Hint centered
+  // Hint: what a click does where the cursor is
   u8g2.setFont(u8g2_font_5x7_tr);
-  const char *hint = isPaused ? "Click:resume  Hold:exit"
-                               : "Click:pause   Hold:exit";
+  const char *hint = editingDigit         ? "Turn: change  Click: done"
+                   : playCursor < ndig    ? "Click: edit  Hold: exit"
+                   : playCursor == ndig   ? "Click: unit  Hold: exit"
+                   : isPaused             ? "Click: resume  Hold: exit"
+                   :                        "Click: pause  Hold: exit";
   int hintW = u8g2.getStrWidth(hint);
-  u8g2.drawStr(64 - hintW / 2, 62, hint);
+  u8g2.drawStr(64 - hintW / 2, 63, hint);
 
   u8g2.sendBuffer();
 }
@@ -1636,32 +2018,67 @@ void drawPlaying() {
 float    *evtDurF       = NULL;  // duration in steps (fractional) per event
 uint32_t *evtSetMasks   = NULL;  // GPIO set masks per event
 uint32_t *evtClrMasks   = NULL;  // GPIO clear masks per event
+uint16_t *evtExtra      = NULL;  // channels 5..16 per event; NULL when the file has <= 4
 volatile int evtCount    = 0;    // number of events
 
+// ──────────────────────────────────────────────
+//  CHANNELS WITHOUT A PIN (5 to 16) — YOUR CODE GOES HERE
+// ──────────────────────────────────────────────
+// Current value of the channels past the 4 pins: bit 0 = channel 5, bit 11 =
+// channel 16. Updated on every event while playing, back to 0 when stopped
+// or paused.
+volatile uint16_t extraChannels = 0;
+
+// Called on every event with channels 5..16, only for files that have them.
+// Empty on purpose: this is where to send them out (an I2C expander, a
+// 74HC595, another board). It runs inside the playback loop on core 0, so
+// keep it short or the signal loses timing accuracy.
+static inline void writeExtraChannels(uint16_t bits) {
+  (void)bits;
+}
+
 TaskHandle_t sigTaskHandle = NULL;
+
+// 64-bit CPU cycle clock for the playback tasks (they always run on core 0,
+// and each core has its own counter). The 32-bit counter wraps every ~18 s
+// at 240 MHz; it is read far more often than that while playing, and after a
+// pause the tasks realign their clock anyway.
+static uint32_t cycLast = 0;
+static uint64_t cycHigh = 0;
+static inline uint64_t cyc64() {
+  uint32_t c = (uint32_t)esp_cpu_get_cycle_count();
+  if (c < cycLast) cycHigh += (1ULL << 32);
+  cycLast = c;
+  return cycHigh | c;
+}
 
 // The signal generator task — runs on Core 0
 // Reads volatile tickUs each event so RPM changes take effect immediately.
 void sigGenTask(void *param) {
   disableCore0WDT();
 
-  // idealUs is the high-precision running target time (µs since boot). We add the
-  // exact fractional hold of each event to it and round only when deriving the
-  // integer microsecond deadline. This keeps sub-µs fractions from being thrown
-  // away every step (which made playback drift fast) and prevents accumulation.
-  double  idealUs  = (double)esp_timer_get_time();   // absolute time reference
-  int64_t nextTick = (int64_t)idealUs;
+  // idealQ is the high-precision running target time, in CPU cycles × 65536
+  // (16 fractional bits). We add the exact fractional hold of each event to it
+  // and round only when deriving the deadline. This keeps fractions from being
+  // thrown away every step (which made playback drift fast) and prevents
+  // accumulation. Counting cycles instead of whole microseconds keeps steps of
+  // a few µs (200 kHz clocks) accurate to a fraction of a microsecond, and
+  // integer math keeps the loop short: the ESP32 has no FPU for doubles.
+  const float cyclesPerUs = (float)getCpuFrequencyMhz();
+  uint64_t idealQ = cyc64() << 16;                    // absolute time reference
+  uint64_t target = idealQ >> 16;
+  float    lastTick = -1.0f, tickQ = 0.0f;            // tickUs in cycles × 65536
 
   while (isPlaying) {
     // Pause handling: drive all outputs LOW and idle until resume or stop.
     // On resume, realign the target clock so the next event starts immediately.
     if (isPaused) {
       GPIO.out_w1tc = ALL_CH_MASK;
+      if (evtExtra) { extraChannels = 0; writeExtraChannels(0); }
       while (isPaused && isPlaying) {
         vTaskDelay(pdMS_TO_TICKS(10));
       }
-      idealUs  = (double)esp_timer_get_time();
-      nextTick = (int64_t)idealUs;
+      idealQ = cyc64() << 16;
       if (!isPlaying) break;
     }
 
@@ -1678,24 +2095,31 @@ void sigGenTask(void *param) {
     uint32_t cm = evtClrMasks[evtIdx];
     if (sm) GPIO.out_w1ts = sm;
     if (cm) GPIO.out_w1tc = cm;
+    if (evtExtra) {
+      extraChannels = evtExtra[evtIdx];
+      writeExtraChannels(extraChannels);
+    }
 
     // Advance the precise target by this event's exact hold (read volatile tickUs
     // each event so RPM changes take effect immediately), then round the absolute
     // deadline to the nearest microsecond. Rounding the cumulative target — not
     // each increment — means per-event rounding never accumulates into drift.
-    idealUs += (double)evtDurF[evtIdx] * (double)tickUs;
-    nextTick = (int64_t)(idealUs + 0.5);
+    float t = tickUs;                                  // read once: it changes live
+    if (t != lastTick) { lastTick = t; tickQ = t * cyclesPerUs * 65536.0f; }
+    idealQ += (uint64_t)(evtDurF[evtIdx] * tickQ + 0.5f);
+    target = (idealQ + 32768) >> 16;
 
     playbackStep = evtIdx + 1;
 
     // Busy-wait until the ABSOLUTE target time
-    while (esp_timer_get_time() < nextTick) {
+    while ((int64_t)(cyc64() - target) < 0) {
       // tight spin — no yield, no sleep
     }
   }
 
   // Done — set all outputs LOW
   GPIO.out_w1tc = ALL_CH_MASK;
+  if (evtExtra) { extraChannels = 0; writeExtraChannels(0); }
 
   enableCore0WDT();
 
@@ -1751,10 +2175,176 @@ void anaGenTask(void *param) {
   vTaskDelete(NULL);   // self-delete
 }
 
+// ──────────────────────────────────────────────
+//  STREAMING (files too big for RAM)
+// ──────────────────────────────────────────────
+#define STREAM_RING 4096                 // events in the ring (power of two)
+ScanInfo   streamInfo;
+StreamEvt *ring         = NULL;
+volatile uint32_t ringHead = 0;          // written by the reader (core 1)
+volatile uint32_t ringTail = 0;          // read by the player (core 0)
+volatile bool readerRunning = false;
+TaskHandle_t readerTaskHandle = NULL;
+uint32_t streamSetLut[16], streamClrLut[16];   // 4 pin bits -> GPIO masks
+
+static inline void ringPush(float dur, uint16_t bits, uint16_t flags) {
+  StreamEvt &e = ring[ringHead & (STREAM_RING - 1)];
+  e.dur = dur < 1e-6f ? 1e-6f : dur;
+  e.bits = bits;
+  e.flags = flags;
+  __sync_synchronize();                  // the event is written before it is published
+  ringHead = ringHead + 1;
+}
+
+// Core 1: reads rows in blocks and keeps the ring full. Each event holds its
+// values until the next row (same as the in-memory parser); at the end of
+// the file the pass wraps: an end marker is dropped (its step already closed
+// the last event), otherwise the last row holds one grid step.
+void sdReaderTask(void *param) {
+  BlockReader r;
+  if (!r.open(signalFilePath, 8192)) {
+    Serial.println(F("[STREAM] Cannot open the file"));
+    readerRunning = false;
+    readerTaskHandle = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+  bool endMarker = streamInfo.rows >= 2 && streamInfo.lastBits == streamInfo.firstBits;
+  r.seek(streamInfo.dataStart);
+  static char line[256];
+  bool     havePrev = false, prevFirst = false, passStart = true;
+  double   prevStep = 0.0;
+  uint16_t prevBits = 0;
+  uint32_t sinceYield = 0;
+
+  while (readerRunning) {
+    if (ringHead - ringTail >= STREAM_RING) { vTaskDelay(1); continue; }
+    int n = r.readLine(line, sizeof(line));
+    if (n < 0) {                         // end of the pass
+      if (havePrev && !endMarker) ringPush((float)streamInfo.gridStep, prevBits, prevFirst ? 1 : 0);
+      havePrev = false;
+      passStart = true;
+      r.seek(streamInfo.dataStart);
+      continue;
+    }
+    if (n == 0 || !isDigit(line[0])) continue;
+    double st; uint16_t bits; int cols;
+    if (!parseRowFast(line, &st, &bits, &cols)) continue;
+    if (havePrev) ringPush((float)(st - prevStep), prevBits, prevFirst ? 1 : 0);
+    prevStep = st; prevBits = bits; prevFirst = passStart; passStart = false;
+    havePrev = true;
+    // With the ring well fed, let the loop (screen, encoder) run now and then
+    if (++sinceYield >= 512) {
+      sinceYield = 0;
+      if (ringHead - ringTail > STREAM_RING / 2) vTaskDelay(1);
+    }
+  }
+  r.close();
+  readerTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+// Core 0: plays the ring with the same absolute clock as sigGenTask.
+void streamGenTask(void *param) {
+  disableCore0WDT();
+  const float cyclesPerUs = (float)getCpuFrequencyMhz();
+  uint64_t idealQ = cyc64() << 16;                    // cycles × 65536, as in sigGenTask
+  uint64_t target = idealQ >> 16;
+  float    lastTick = -1.0f, tickQ = 0.0f;
+  bool    first    = true;
+  bool    extras   = fileChannels > NUM_CHANNELS;
+
+  while (isPlaying) {
+    if (isPaused) {
+      GPIO.out_w1tc = ALL_CH_MASK;
+      if (extras) { extraChannels = 0; writeExtraChannels(0); }
+      while (isPaused && isPlaying) vTaskDelay(pdMS_TO_TICKS(10));
+      idealQ = cyc64() << 16;
+      if (!isPlaying) break;
+    }
+
+    if (ringTail == ringHead) {
+      // The card fell behind: hold the outputs until it catches up, then
+      // restart the clock from now (no catching up with a burst).
+      underruns = underruns + 1;
+      while (isPlaying && !isPaused && ringTail == ringHead) { }
+      idealQ = cyc64() << 16;
+      continue;
+    }
+
+    StreamEvt e = ring[ringTail & (STREAM_RING - 1)];
+    __sync_synchronize();
+    ringTail = ringTail + 1;
+
+    if (e.flags & 1) { if (!first) loopCount = loopCount + 1; first = false; }
+    uint8_t lo = e.bits & 0x0F;
+    if (streamSetLut[lo]) GPIO.out_w1ts = streamSetLut[lo];
+    if (streamClrLut[lo]) GPIO.out_w1tc = streamClrLut[lo];
+    if (extras) {
+      extraChannels = e.bits >> NUM_CHANNELS;
+      writeExtraChannels(extraChannels);
+    }
+
+    float t = tickUs;
+    if (t != lastTick) { lastTick = t; tickQ = t * cyclesPerUs * 65536.0f; }
+    idealQ += (uint64_t)(e.dur * tickQ + 0.5f);
+    target = (idealQ + 32768) >> 16;
+    playbackStep = playbackStep + 1;
+    while ((int64_t)(cyc64() - target) < 0) {
+      // tight spin — no yield, no sleep
+    }
+  }
+
+  GPIO.out_w1tc = ALL_CH_MASK;
+  if (extras) { extraChannels = 0; writeExtraChannels(0); }
+  enableCore0WDT();
+  sigTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+// Starts the reader and waits until the ring is full (or 2 s) before playing.
+bool startStreaming() {
+  if (!ring) ring = (StreamEvt *)malloc(STREAM_RING * sizeof(StreamEvt));
+  if (!ring) { Serial.println(F("[STREAM] No memory for the buffer")); return false; }
+  for (int lo = 0; lo < 16; lo++) {
+    uint32_t sm = 0, cm = 0;
+    for (int c = 0; c < NUM_CHANNELS; c++) {
+      if (lo & (1 << c)) sm |= (1UL << sigPins[c]); else cm |= (1UL << sigPins[c]);
+    }
+    streamSetLut[lo] = sm; streamClrLut[lo] = cm;
+  }
+  ringHead = 0;
+  ringTail = 0;
+  underruns = 0;
+  readerRunning = true;
+  // Same priority as the Arduino loop (1), which sleeps 1 ms per pass while a
+  // file streams: the reader gets nearly all of core 1, yet the screen, the
+  // encoder and the serial console never starve. With a higher priority, a
+  // card that could not keep up (very fast signals) left them frozen.
+  xTaskCreatePinnedToCore(sdReaderTask, "SdRead", 6144, NULL, 1, &readerTaskHandle, 1);
+  uint32_t t0 = millis();
+  while (readerRunning && ringHead < STREAM_RING - 8 && millis() - t0 < 2000) delay(5);
+  if (!readerRunning) return false;
+  Serial.printf("[STREAM] Buffer primed with %u events\n", (unsigned)ringHead);
+  return true;
+}
+
+void stopStreaming() {
+  readerRunning = false;
+  uint32_t t0 = millis();
+  while (readerTaskHandle != NULL && millis() - t0 < 1500) delay(5);
+  if (ring) { free(ring); ring = NULL; }
+  if (underruns) {
+    Serial.printf("[STREAM] %u underruns: the card could not keep up at this speed\n",
+                  (unsigned)underruns);
+  }
+}
+
 void freeSigBuffers() {
   if (evtDurF)      { free(evtDurF);      evtDurF      = NULL; }
   if (evtSetMasks)  { free(evtSetMasks);  evtSetMasks  = NULL; }
   if (evtClrMasks)  { free(evtClrMasks);  evtClrMasks  = NULL; }
+  if (evtExtra)     { free(evtExtra);     evtExtra     = NULL; }
 }
 
 // Build flat arrays from signalEvents and pre-compute GPIO masks + store durations
@@ -1770,6 +2360,15 @@ bool prepareSigBuffers() {
     Serial.println(F("[SIG] malloc failed for event buffers"));
     freeSigBuffers();
     return false;
+  }
+  // Channels 5..16 only take memory when the file has them
+  if (fileChannels > NUM_CHANNELS) {
+    evtExtra = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!evtExtra) {
+      Serial.println(F("[SIG] malloc failed for channels 5-16"));
+      freeSigBuffers();
+      return false;
+    }
   }
 
   for (int i = 0; i < n; i++) {
@@ -1787,6 +2386,7 @@ bool prepareSigBuffers() {
     }
     evtSetMasks[i] = sm;
     evtClrMasks[i] = cm;
+    if (evtExtra) evtExtra[i] = signalEvents[i].extra;
   }
 
   evtCount = n;
@@ -1831,7 +2431,9 @@ void startPlayback() {
 
   initOutputPins();
 
-  if (signalMode == MODE_DIGITAL) {
+  if (signalMode == MODE_DIGITAL && streamMode) {
+    // Big file: nothing to prepare here, the ring is filled when it starts
+  } else if (signalMode == MODE_DIGITAL) {
     if (!prepareSigBuffers()) {
       Serial.println(F("[PLAY] Buffer allocation failed!"));
       return;
@@ -1841,8 +2443,8 @@ void startPlayback() {
     return;
   }
 
-  // Compute initial tickUs from current RPM
-  recalcTickFromRPM();
+  // Compute initial tickUs from the current speed
+  recalcTick();
 
   // ── DIAGNOSTIC: compare our computed per-step time against the file's STEP_TIME ──
   // If these differ, the 4-5 us/pulse offset comes from our RPM->tick model (our
@@ -1867,14 +2469,20 @@ void startPlayback() {
   playbackStep = 0;
   loopCount = 0;
   isPaused = false;
+  if (signalMode == MODE_DIGITAL && streamMode && !startStreaming()) {
+    stopStreaming();
+    Serial.println(F("[PLAY] Could not start reading the file"));
+    return;
+  }
   isPlaying = true;
   appState = STATE_PLAYING;
+  resetPlayCursor();
   drawPlaying();     // draw BEFORE launching task (no I2C during playback)
 
   // Launch signal task on Core 0 with highest priority
   bool analog = (signalMode == MODE_ANALOG);
   xTaskCreatePinnedToCore(
-    analog ? anaGenTask : sigGenTask,   // task function
+    analog ? anaGenTask : (streamMode ? streamGenTask : sigGenTask),   // task function
     analog ? "AnaGen" : "SigGen",       // name
     analog ? 4096 : 2048,               // stack size (dacWrite needs more)
     NULL,              // param
@@ -1883,11 +2491,11 @@ void startPlayback() {
     0                  // Core 0 (Arduino runs on Core 1)
   );
 
-  Serial.printf("[PLAY] Started on Core 0: %s, %d %s, %u RPM, %u cycles, "
+  Serial.printf("[PLAY] Started on Core 0: %s%s, %d %s, %s, "
                 "tick=%.3f us\n",
-                analog ? "analog" : "digital",
+                analog ? "analog" : "digital", streamMode ? " (streamed)" : "",
                 signalTotalEvents, analog ? "segments" : "events",
-                (unsigned)currentRPM, (unsigned)signalCycles, (float)tickUs);
+                speedLabel().c_str(), (float)tickUs);
 }
 
 void stopPlayback() {
@@ -1919,6 +2527,7 @@ void stopPlayback() {
   for (int c = 0; c < NUM_CHANNELS; c++) {
     gpio_set_level(sigPins[c], 0);
   }
+  if (streamMode) stopStreaming();
   freeSigBuffers();
   Serial.printf("[PLAY] Stopped after %u loops\n", (unsigned)loopCount);
 }
@@ -1943,7 +2552,7 @@ void openSelected() {
     // Open .txt file → parse as signal file (digital or analog) → play
     String path = currentPath.endsWith("/") ? currentPath + sel.name
                                             : currentPath + "/" + sel.name;
-    if (!openSignalFile(path, sel.name, false)) {
+    if (!openSignalFile(path, sel.name, true)) {
       // Parse failed, fall back to text viewer
       readFileContent(signalFilePath);
       resetHeaderScroll(sel.name);
@@ -1953,12 +2562,11 @@ void openSelected() {
   }
 }
 
-// Parses a signal file and, as the verified flow did: with CYCLES in the
-// metadata it plays right away, otherwise it goes to the cycles screen.
-// `autoStart` (serial, or no OLED to show that screen) always plays right
-// away, with the default cycles — "cycles <n>" changes them at any time.
-// An RPM in the metadata becomes the start speed.
-bool openSignalFile(const String &path, const String &name, bool autoStart) {
+// Parses a signal file and plays it right away. An RPM in the metadata
+// becomes the start speed.
+// With the OLED (askUnit) the unit selection screen comes first; from the
+// serial console, or without a screen, it plays right away in the last unit.
+bool openSignalFile(const String &path, const String &name, bool askUnit) {
   signalFilePath = path;
   signalFileName = name;
 
@@ -1972,37 +2580,133 @@ bool openSignalFile(const String &path, const String &name, bool autoStart) {
   Serial.printf("[FILE] Opening %s\n", path.c_str());
 
   bool analog = isAnalogFile(path);
-  bool ok = analog ? parseAnalogFile(path) : parseSignalFile(path);
+#if !SOC_DAC_SUPPORTED
+  if (analog) {
+    Serial.println(F("[FILE] Analog file: this board has no DAC (ESP32-S3), digital files only"));
+    if (oledPresent) {
+      u8g2.clearBuffer();
+      u8g2.drawStr(4, 28, "Analog file:");
+      u8g2.drawStr(4, 44, "needs ESP32 (DAC)");
+      u8g2.sendBuffer();
+      delay(2000);
+    }
+    return false;
+  }
+#endif
+  bool ok;
+  streamMode = false;
+  if (analog) {
+    ok = parseAnalogFile(path);
+  } else {
+    // One fast pass first. Small files then load into RAM as always; big
+    // ones (their events would not fit) play streamed from the card.
+    ScanInfo info;
+    ok = scanSignalFile(path, &info);
+    uint32_t heap = ESP.getFreeHeap();
+    bool fits = ok && info.rows <= 3000 && info.rows * 80UL < heap / 2;
+    if (ok && fits) {
+      ok = parseSignalFile(path);
+    } else if (ok) {
+      freeSigBuffers();
+      freeAnaBuffers();
+      signalEvents.clear();
+      streamInfo = info;
+      streamMode = true;
+      fileChannels = info.channels;
+      bool endMarker = info.rows >= 2 && info.lastBits == info.firstBits;
+      signalTotalEvents = (int)(endMarker ? info.rows - 1 : info.rows);
+      signalTotalStepsF = (float)(info.lastStep - info.firstStep);   // same as the in-memory parser
+      signalMode = MODE_DIGITAL;
+      if (signalTotalStepsF < 1e-3f) {
+        Serial.println(F("[SIG] Signal has no length"));
+        ok = false;
+      } else {
+        Serial.printf("[SIG] Too big for RAM (%u rows, %u bytes free): streaming from the card\n",
+                      (unsigned)info.rows, (unsigned)heap);
+      }
+    }
+  }
   if (!ok) {
+    streamMode = false;
     Serial.println(F("[FILE] Not a playable signal file"));
     return false;
   }
 
-  if (metaRPM > 0) {
-    int rpm = metaRPM;
-    if (rpm < RPM_MIN) rpm = RPM_MIN;
-    if (rpm > RPM_MAX) rpm = RPM_MAX;
-    currentRPM = (uint32_t)rpm;
+  // Start speed (the amount, not the unit): the file's STEP_TIME first, else
+  // its RPM turned into µs/step. Without either, the last speed is kept.
+  fileStartUs = 0.0f;
+  if (metaStepTime > 0.0f) {
+    fileStartUs = metaStepTime;
+  } else if (metaRPM > 0 && signalTotalStepsF > 1e-3f) {
+    fileStartUs = 60000000.0f / ((float)metaRPM * signalTotalStepsF);
   }
+  Serial.printf("[FILE] Start speed: %s\n",
+                metaStepTime > 0.0f ? "STEP_TIME" : (metaRPM > 0 ? "RPM" : "last used"));
 
-  if (metaCycles > 0) {
-    // If metadata specifies CYCLES, skip config and play directly
-    int c = metaCycles;
-    if (c < CYCLES_MIN) c = CYCLES_MIN;
-    if (c > CYCLES_MAX) c = CYCLES_MAX;
-    signalCycles = (uint8_t)c;
-    startPlayback();
-  } else {
-    signalCycles = CYCLES_DEFAULT;
-    if (autoStart || !oledPresent) {
-      startPlayback();
-    } else {
-      // No timing info in metadata — show configuration screen
-      appState = STATE_SIG_CONFIG;
-      drawSigConfig();
-    }
+  if (askUnit && oledPresent) {
+    unitCursor = speedUnit;   // the last unit used comes preselected
+    appState = STATE_UNIT_SELECT;
+    drawUnitSelect();
+    return true;
   }
+  playWithUnit(speedUnit);
   return true;
+}
+
+// Applies the file's start speed in `unit` and plays.
+void playWithUnit(uint8_t unit) {
+  if (fileStartUs > 0.0f) {
+    setSpeedFromUs(unit, fileStartUs);
+  } else {
+    setSpeedUnit(unit);   // no speed in the file: the last one, in this unit
+  }
+  saveSpeedUnit();
+  startPlayback();
+}
+
+// ──────────────────────────────────────────────
+//  DRAW UNIT SELECTION SCREEN
+// ──────────────────────────────────────────────
+// The four units, each with the start speed it would play at; the encoder
+// moves, a click plays, holding goes back to the files.
+void drawUnitSelect() {
+  if (!oledPresent) return;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.setDrawColor(1);
+  const char *title = "Speed unit";
+  u8g2.drawStr(64 - u8g2.getStrWidth(title) / 2, 7, title);
+  u8g2.drawHLine(0, HEADER_H - 1, 128);
+
+  // What each unit would show, without touching the live speed
+  float us = fileStartUs > 0.0f ? fileStartUs : (float)tickUs;
+  u8g2.setFont(u8g2_font_6x10_tr);
+  for (uint8_t u = 0; u < UNIT_COUNT; u++) {
+    int y = HEADER_H + 2 + u * 11;
+    String value;
+    if (u == UNIT_RPM) {
+      long rpm = signalTotalStepsF > 1e-3f && us > 0.0f
+                 ? lroundf(60000000.0f / (us * signalTotalStepsF)) : (long)currentRPM;
+      if (rpm < RPM_MIN) rpm = RPM_MIN;
+      if (rpm > RPM_MAX) rpm = RPM_MAX;
+      value = String(rpm);
+    } else {
+      float v = u == UNIT_US  ? us
+              : u == UNIT_BPS ? 1000000.0f / us
+              :                 1000000.0f / (2.0f * us);
+      if (v < UNIT_MIN[u]) v = UNIT_MIN[u];
+      if (v > UNIT_MAX[u]) v = UNIT_MAX[u];
+      value = String(v, u == UNIT_BPS ? 0 : 2);
+    }
+    if (u == unitCursor) {
+      u8g2.drawBox(0, y, 128, 11);
+      u8g2.setDrawColor(0);
+    }
+    u8g2.drawStr(4, y + 9, UNIT_LABELS[u]);
+    u8g2.drawStr(124 - u8g2.getStrWidth(value.c_str()), y + 9, value.c_str());
+    u8g2.setDrawColor(1);
+  }
+  u8g2.sendBuffer();
 }
 
 // ──────────────────────────────────────────────
@@ -2012,21 +2716,14 @@ void goBack() {
   if (appState == STATE_PLAYING) {
     // Stop playback
     stopPlayback();
-    // If metadata fully specified timing, go back to browser (config was skipped)
-    if (metaCycles > 0 || !oledPresent) {
-      appState = STATE_BROWSER;
-      resetHeaderScroll(currentPath);
-      drawBrowser();
-    } else {
-      // Go back to signal config
-      appState = STATE_SIG_CONFIG;
-      drawSigConfig();
-    }
+    appState = STATE_BROWSER;
+    resetHeaderScroll(currentPath);
+    drawBrowser();
     return;
   }
 
-  if (appState == STATE_SIG_CONFIG) {
-    // Go back to browser
+  if (appState == STATE_UNIT_SELECT) {
+    // Back to the files without playing
     appState = STATE_BROWSER;
     resetHeaderScroll(currentPath);
     drawBrowser();
@@ -2115,20 +2812,29 @@ void handleEncoder() {
     }
     drawFileViewer();
 
-  } else if (appState == STATE_SIG_CONFIG) {
-    // Adjust crank revolutions per file (CYCLES_MIN .. CYCLES_MAX)
-    int32_t newC = (int32_t)signalCycles + ticks;
-    if (newC < CYCLES_MIN) newC = CYCLES_MIN;
-    if (newC > CYCLES_MAX) newC = CYCLES_MAX;
-    signalCycles = (uint8_t)newC;
-    drawSigConfig();
+
+  } else if (appState == STATE_UNIT_SELECT) {
+    // Move between the four units, without wrapping
+    int c = (int)unitCursor + (ticks > 0 ? 1 : -1);
+    if (c < 0) c = 0;
+    if (c >= UNIT_COUNT) c = UNIT_COUNT - 1;
+    unitCursor = (uint8_t)c;
+    drawUnitSelect();
 
   } else if (appState == STATE_PLAYING) {
-    // Adjust RPM mid-generation (100 .. 8000, step 100)
-    stepRPM(ticks);
-    // Recalculate tickUs — the signal task reads it on-the-fly
-    recalcTickFromRPM();
-    // Update display to show new RPM
+    if (editingDigit) {
+      // Change the blinking digit — live, the signal task reads tickUs on the fly
+      editSpeedDigit(ticks > 0 ? 1 : -1);
+      blinkOn = true;            // show the new value right away
+      blinkAt = millis();
+    } else {
+      // Move between the digits, the unit and Pause, without wrapping
+      int c = (int)playCursor + (ticks > 0 ? 1 : -1);
+      int last = speedDigitCount() + 1;
+      if (c < 0) c = 0;
+      if (c > last) c = last;
+      playCursor = (uint8_t)c;
+    }
     drawPlaying();
   }
 }
@@ -2149,24 +2855,60 @@ void onButtonClick(Button2 &btn) {
     return;
   }
 
-  if (appState == STATE_SIG_CONFIG) {
-    // Click → start playback with current cycles and RPM
-    startPlayback();
+  if (appState == STATE_UNIT_SELECT) {
+    // Click → play in the highlighted unit
+    playWithUnit(unitCursor);
     return;
   }
 
   if (appState == STATE_PLAYING) {
-    // Short click toggles pause/resume. Long click exits (handled elsewhere).
-    isPaused = !isPaused;
+    // Click acts on what the cursor is on: a digit (start/finish editing it),
+    // the unit (next one, same speed) or Pause/Resume. Hold exits.
+    uint8_t ndig = speedDigitCount();
+    if (playCursor < ndig) {
+      editingDigit = !editingDigit;
+      blinkOn = true;
+      blinkAt = millis();
+      if (!editingDigit) {
+        Serial.printf("[CMD] Speed: %s (tick %.4f us/step)\n", speedLabel().c_str(), (float)tickUs);
+      }
+    } else if (playCursor == ndig) {
+      setSpeedUnit((speedUnit + 1) % UNIT_COUNT);
+      saveSpeedUnit();
+      playCursor = speedDigitCount();   // stay on the unit
+    } else {
+      isPaused = !isPaused;
+    }
     drawPlaying();
     return;
   }
   // In file viewer, click does nothing (long click to go back)
 }
 
+// Double click while playing: next speed unit. Anywhere else it counts as a
+// single click, so a quick double press in the browser still opens.
+void onButtonDoubleClick(Button2 &btn) {
+  if (appState != STATE_PLAYING) { onButtonClick(btn); return; }
+  // The digit count changes with the unit: a cursor on the unit or on Pause
+  // stays there, one on a digit goes back to the first significant digit.
+  uint8_t past = playCursor >= speedDigitCount() ? playCursor - speedDigitCount() : 255;
+  setSpeedUnit((speedUnit + 1) % UNIT_COUNT);
+  saveSpeedUnit();
+  if (past != 255) { playCursor = speedDigitCount() + past; editingDigit = false; }
+  else resetPlayCursor();
+  drawPlaying();
+  Serial.printf("[UNIT] %s (tick %.4f us/step)\n", speedLabel().c_str(), (float)tickUs);
+}
+
 void onButtonLongClick(Button2 &btn) {
+  // While a digit is being edited, holding only finishes the edit
+  if (appState == STATE_PLAYING && editingDigit) {
+    editingDigit = false;
+    drawPlaying();
+    return;
+  }
   if (appState == STATE_BROWSER || appState == STATE_VIEW_FILE ||
-      appState == STATE_SIG_CONFIG || appState == STATE_PLAYING) {
+      appState == STATE_UNIT_SELECT || appState == STATE_PLAYING) {
     goBack();
   }
 }
@@ -2201,12 +2943,13 @@ void printHelp() {
   Serial.println(F("  ls                 list the current folder"));
   Serial.println(F("  cd <n|name|..|/>   change folder"));
   Serial.println(F("  play <n|name>      open and play a file (digital or analog)"));
-  Serial.println(F("  start              play the file waiting on the cycles screen"));
   Serial.println(F("  stop               stop playback"));
   Serial.println(F("  pause | resume     pause / resume playback (also: p)"));
   Serial.println(F("  rpm <100-8000>     set the speed (live while playing)"));
   Serial.println(F("  rpm + | rpm -      speed up / down by 100"));
-  Serial.println(F("  cycles <1-8>       set the signal cycles"));
+  Serial.println(F("  speed <v> [unit]   set the speed, in us | rpm | bps | hz"));
+  Serial.println(F("  speed + | speed -  speed up / down, in the current unit"));
+  Serial.println(F("  unit <us|rpm|bps|hz>  same speed, shown in another unit"));
   Serial.println(F("  status             show what is playing"));
   Serial.println(F("  help               this list"));
   Serial.println(F("─────────────────────────────────────────"));
@@ -2288,7 +3031,7 @@ void changeDirectory(const String &arg) {
 void printStatus() {
   const char *state = "browser";
   if (appState == STATE_PLAYING)         state = isPaused ? "paused" : "playing";
-  else if (appState == STATE_SIG_CONFIG) state = "waiting on cycles screen ('start')";
+  else if (appState == STATE_UNIT_SELECT) state = "picking the speed unit on the screen";
   else if (appState == STATE_VIEW_FILE)  state = "viewing file";
 
   Serial.println(F("[STATUS] ─────────────────────────"));
@@ -2299,11 +3042,14 @@ void printStatus() {
     Serial.printf("[STATUS] mode         : %s\n", modeLabel().c_str());
     Serial.printf("[STATUS] steps/cycle  : %.4f\n", signalTotalStepsF);
   }
-  Serial.printf("[STATUS] RPM          : %u\n", (unsigned)currentRPM);
-  Serial.printf("[STATUS] cycles       : %u\n", (unsigned)signalCycles);
+  Serial.printf("[STATUS] speed        : %s\n", speedLabel().c_str());
   if (appState == STATE_PLAYING) {
     Serial.printf("[STATUS] tick         : %.4f us/step\n", (float)tickUs);
     Serial.printf("[STATUS] loops        : %u\n", (unsigned)loopCount);
+    if (streamMode) {
+      Serial.printf("[STATUS] streamed     : yes, %u in buffer, %u underruns\n",
+                    (unsigned)(ringHead - ringTail), (unsigned)underruns);
+    }
   }
   Serial.printf("[STATUS] OLED         : %s\n", oledPresent ? "yes" : "no");
 }
@@ -2313,9 +3059,44 @@ static void setRPM(long rpm) {
   if (rpm < RPM_MIN) rpm = RPM_MIN;
   if (rpm > RPM_MAX) rpm = RPM_MAX;
   currentRPM = (uint32_t)rpm;
-  recalcTickFromRPM();   // the signal task reads it on-the-fly
+  speedUnit = UNIT_RPM;
+  recalcTick();   // the signal task reads it on-the-fly
   if (appState == STATE_PLAYING) drawPlaying();
-  Serial.printf("[CMD] RPM: %u (tick %.4f us/step)\n", (unsigned)currentRPM, (float)tickUs);
+  Serial.printf("[CMD] Speed: %s (tick %.4f us/step)\n", speedLabel().c_str(), (float)tickUs);
+}
+
+// "us", "rpm", "bps", "hz" → unit index, or UNIT_COUNT if it is none of them.
+static uint8_t parseUnit(String name) {
+  name.toLowerCase();
+  if (name == "us/step") name = "us";
+  for (uint8_t u = 0; u < UNIT_COUNT; u++) if (name == UNIT_NAMES[u]) return u;
+  return UNIT_COUNT;
+}
+
+// "speed <value> [unit]" · "speed +" · "speed -" · "speed" (show)
+static void speedCommand(String arg) {
+  if (arg == "+" || arg == "-") {
+    stepSpeed(arg == "+" ? 1 : -1);
+  } else if (arg.length() > 0) {
+    int sp = arg.indexOf(' ');
+    String value = sp < 0 ? arg : arg.substring(0, sp);
+    String unitName = sp < 0 ? String("") : arg.substring(sp + 1);
+    unitName.trim();
+    if (unitName.length() > 0) {
+      uint8_t u = parseUnit(unitName);
+      if (u == UNIT_COUNT) { Serial.println(F("[CMD] Unit: us | rpm | bps | hz")); return; }
+      speedUnit = u;
+      saveSpeedUnit();
+    }
+    float v = value.toFloat();
+    if (speedUnit == UNIT_RPM) { setRPM(lroundf(v)); return; }
+    if (v < UNIT_MIN[speedUnit]) v = UNIT_MIN[speedUnit];
+    if (v > UNIT_MAX[speedUnit]) v = UNIT_MAX[speedUnit];
+    speedValue = v;
+    recalcTick();
+  }
+  if (appState == STATE_PLAYING) drawPlaying();
+  Serial.printf("[CMD] Speed: %s (tick %.4f us/step)\n", speedLabel().c_str(), (float)tickUs);
 }
 
 void handleSerialLine(String line) {
@@ -2330,6 +3111,10 @@ void handleSerialLine(String line) {
 
   if (cmd == "help" || cmd == "?") {
     printHelp();
+
+  } else if ((cmd == "ls" || cmd == "cd") && streamMode && isPlaying) {
+    // The card is being read for the signal: one reader at a time
+    Serial.println(F("[CMD] Stop playback first (the file is being read from the card)"));
 
   } else if (cmd == "ls") {
     listDirectory();
@@ -2352,11 +3137,7 @@ void handleSerialLine(String line) {
       return;
     }
     if (appState == STATE_PLAYING) stopPlayback();
-    if (!openSignalFile(path, name, true)) showBrowserIfIdle();
-
-  } else if (cmd == "start") {
-    if (appState == STATE_SIG_CONFIG) startPlayback();
-    else Serial.println(F("[CMD] Nothing waiting to start (use 'play <file>')"));
+    if (!openSignalFile(path, name, false)) showBrowserIfIdle();
 
   } else if (cmd == "stop") {
     if (appState == STATE_PLAYING) stopPlayback();
@@ -2377,16 +3158,18 @@ void handleSerialLine(String line) {
     else if (arg.length() > 0 && isDigit(arg.charAt(0))) setRPM(arg.toInt());
     else Serial.printf("[CMD] RPM: %u\n", (unsigned)currentRPM);
 
-  } else if (cmd == "cycles") {
-    if (arg.length() > 0 && isDigit(arg.charAt(0))) {
-      long c = arg.toInt();
-      if (c < CYCLES_MIN) c = CYCLES_MIN;
-      if (c > CYCLES_MAX) c = CYCLES_MAX;
-      signalCycles = (uint8_t)c;
-      if (appState == STATE_SIG_CONFIG) drawSigConfig();
-      if (appState == STATE_PLAYING)    drawPlaying();
+  } else if (cmd == "speed") {
+    speedCommand(arg);
+
+  } else if (cmd == "unit") {
+    if (arg.length() > 0) {
+      uint8_t u = parseUnit(arg);
+      if (u == UNIT_COUNT) { Serial.println(F("[CMD] Unit: us | rpm | bps | hz")); return; }
+      setSpeedUnit(u);
+      saveSpeedUnit();
+      if (appState == STATE_PLAYING) drawPlaying();
     }
-    Serial.printf("[CMD] Cycles: %u\n", (unsigned)signalCycles);
+    Serial.printf("[CMD] Speed: %s (tick %.4f us/step)\n", speedLabel().c_str(), (float)tickUs);
 
   } else if (cmd == "status") {
     printStatus();

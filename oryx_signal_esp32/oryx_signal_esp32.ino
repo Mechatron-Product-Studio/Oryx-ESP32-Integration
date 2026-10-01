@@ -25,16 +25,29 @@
  * la computadora lo abren solos. Si no, está en http://192.168.4.1.
  *
  * ── Cómo llega la señal ────────────────────────────────────────────────────
- * La app arma la señal que está en pantalla y la manda entera antes de
- * arrancar. Nunca se transmite mientras se reproduce: el micro reproduce de su
- * propia memoria, así que ni el WiFi ni el cable afectan al tiempo de la
- * señal.
+ * Si entra en la memoria (hasta MAX_FILAS cambios de estado), la app la manda
+ * entera antes de arrancar y el micro la reproduce de su memoria: ni el WiFi
+ * ni el cable afectan al tiempo de la señal.
+ *
+ * Si es más larga (millones de pasos), la app la manda MIENTRAS SUENA, como el
+ * firmware de la microSD lee su tarjeta: el micro tiene un búfer circular de
+ * eventos que la app mantiene lleno, con créditos (ver STREAMING). El tiempo
+ * de la señal sigue saliendo del reloj del micro; el enlace solo tiene que
+ * llegar a tiempo. Si no llega (señales muy rápidas, un WiFi que se traba),
+ * la salida se sostiene hasta que llegan más eventos y se cuenta una falta.
  *
  *   digital   → una fila por cada cambio de estado: en qué paso ocurre y qué
  *               valor toma cada canal, todos juntos en una máscara de bits.
+ *               Se reciben los 16 canales de Oryx; los 8 primeros salen por
+ *               un pin y los otros 8 quedan en `canalesExtra` para tu código
+ *               (ver CANALES SIN PIN).
  *   analógico → la app muestrea la curva y manda los niveles ya listos. Es la
  *               forma más fiel: lo que sale por el DAC es exactamente lo que
  *               se dibujó, con sus curvas y sus esquinas redondeadas.
+ *
+ * El tiempo se mide con el contador de ciclos de la CPU (240 por µs) en punto
+ * fijo, así que un paso puede durar hasta 2,5 µs (relojes de 200 kHz) y cada
+ * flanco cae a una fracción de microsegundo de donde debe.
  *
  * ── Los dos núcleos ────────────────────────────────────────────────────────
  * La reproducción vive sola en el núcleo 1 y no se detiene por nada: es un
@@ -44,14 +57,21 @@
  * setup(): el bucle de espera es justamente lo que ese vigilante castigaría.
  *
  * ── Voltaje ────────────────────────────────────────────────────────────────
- * En analógico el voltaje escala directo lo que sale por el DAC (0 – 3,3 V).
- * En digital una salida GPIO no sabe de niveles intermedios, así que el valor
- * se saca por PIN_REFERENCIA como tensión de referencia continua: es la que
- * alimenta la etapa externa (divisor, buffer o traductor de nivel) que fija la
- * altura real de los pulsos. Sin esa etapa, los pines salen siempre a 3,3 V.
+ * El voltaje (0 a 99,99 V) solo se recibe y se guarda: el equipo no lo usa
+ * para nada. Queda en `mv`, en milivoltios, para quien adapte este firmware a
+ * su circuito (una etapa de potencia, un DAC externo, lo que haga falta). Las
+ * salidas digitales salen a 3,3 V y las analógicas usan todo el rango del DAC.
  *
- * Placa: ESP32 clásico (WROOM / DevKit v1). Sin librerías externas: todo lo
- * que se incluye viene con el core de Arduino para ESP32 (2.x o 3.x).
+ * Placas: ESP32 clásico (WROOM / DevKit v1) y ESP32-S3 (DevKitC-1 y
+ * compatibles). Sin librerías externas: todo lo que se incluye viene con el
+ * core de Arduino para ESP32 (2.x o 3.x para el clásico, 3.x para el S3).
+ *
+ * ── ESP32-S3 ───────────────────────────────────────────────────────────────
+ * El S3 no tiene DAC, así que en él el equipo es solo digital: no hay salidas
+ * analógicas. Los pines
+ * cambian porque el S3 no tiene del 22 al 25 (ver PINES más abajo). Se compila
+ * con "USB CDC On Boot" activado para que la app hable por cualquiera de los
+ * dos conectores de la placa: el USB nativo y el del conversor (UART).
  */
 
 #include <WiFi.h>
@@ -60,7 +80,9 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <esp_timer.h>
+#include <esp_cpu.h>
 #include <soc/gpio_reg.h>
+#include <soc/soc_caps.h>
 #include <stdarg.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,19 +117,50 @@ static const char* MDNS_PROTO    = "_tcp";
 static char nombreEquipo[24];
 static char idEquipo[8];
 
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+/**
+ * ESP32-S3. Se evitan los pines de arranque (0, 3, 45, 46), los del USB
+ * nativo (19, 20), los del UART (43, 44), los de la memoria (26 a 37) y los
+ * del LED RGB de las placas de desarrollo (38, 48). Todos quedan por debajo
+ * del 32, que es lo que permite escribirlos juntos en un solo registro.
+ */
+static const char*   CHIP = "ESP32-S3";
+static const uint8_t PINES[] = { 4, 5, 6, 7, 15, 16, 17, 18 };
+#else
+static const char*   CHIP = "ESP32";
 /** Salidas digitales, en el mismo orden que los canales de la app. */
 static const uint8_t PINES[] = { 16, 17, 18, 19, 21, 22, 23, 13 };
-static const uint8_t MAX_CANALES_D = sizeof(PINES) / sizeof(PINES[0]);
+#endif
+/** Canales digitales que salen por un pin (los primeros, en orden). */
+static const uint8_t CANALES_CON_PIN = sizeof(PINES) / sizeof(PINES[0]);
+/**
+ * Canales digitales que se reciben: los 16 que se pueden diseñar en Oryx. Los
+ * que pasan de CANALES_CON_PIN no salen por ningún pin; se guardan con la
+ * señal y se entregan en `escribirCanalesExtra` para quien los quiera usar.
+ */
+static const uint8_t MAX_CANALES_D = 16;
 
+/**
+ * Las salidas analógicas son los DAC del chip. El S3 no tiene: ahí el equipo
+ * es solo digital y todo lo analógico queda afuera de la compilación.
+ */
+#define HAY_ANALOGICAS SOC_DAC_SUPPORTED
+#if HAY_ANALOGICAS
 /** Salidas analógicas: los dos DAC del ESP32. */
 static const uint8_t PINES_DAC[] = { 25, 26 };
 static const uint8_t MAX_CANALES_A = sizeof(PINES_DAC) / sizeof(PINES_DAC[0]);
 
-/** Tensión de referencia para la etapa externa del modo digital. */
-static const uint8_t PIN_REFERENCIA = 25;
+#else
+static const uint8_t MAX_CANALES_A = 0;
+#endif
 
-/** Velocidad del puerto serie. Tiene que coincidir con la de la app. */
-static const uint32_t BAUDIOS = 115200;
+/**
+ * Velocidad del puerto serie. Tiene que coincidir con la de la app (que, si no
+ * hay respuesta, prueba también 115 200 para los firmware anteriores). Rápida
+ * porque las señales largas viajan mientras suenan. El monitor serie del
+ * Arduino IDE tiene que estar a esta misma velocidad.
+ */
+static const uint32_t BAUDIOS = 921600;
 
 /**
  * Buffer de entrada del puerto serie.
@@ -116,22 +169,21 @@ static const uint32_t BAUDIOS = 115200;
  * de caracteres seguidos, sin control de flujo que los frene, y el buffer
  * tiene que absorber lo que llegue mientras la tarea está en otra cosa.
  */
-static const size_t RX_SERIE = 4096;
+static const size_t RX_SERIE = 8192;
 
 /** Tope de la señal que entra en memoria. */
 #define MAX_FILAS     2048               // cambios de estado, modo digital
 #define MAX_MUESTRAS  6000               // muestras por canal, modo analógico
 #define RX_BUF        8192               // mensaje de WebSocket más largo admitido
 
-/** Tensión de fondo de escala del DAC, en milivoltios. */
-static const uint32_t V_MAX_MV = 3300;
+/** Tope del voltaje que se acepta, en milivoltios (99,99 V). */
+static const uint32_t V_MAX_MV = 99990;
 
 /** Tope de la velocidad. Con 0 rpm manda el tiempo de paso. */
-static const uint32_t RPM_MAX = 8000;
+static const float RPM_MAX = 8000.0f;
 
-/** Ciclos de la señal: cuántas vueltas del cigüeñal trae una pasada (CKP/CMP). */
-static const uint32_t CICLOS_MIN = 1;
-static const uint32_t CICLOS_MAX = 8;
+/** Tiempo de paso más corto que se acepta a mano, en microsegundos. */
+static const float US_MIN = 2.5f;
 
 /** Versión del protocolo. La app se niega a hablar con otra. */
 static const uint8_t PROTO = 1;
@@ -191,10 +243,22 @@ enum WsRead : uint8_t {
 
 enum Modo : uint8_t { MODO_NADA = 0, MODO_DIGITAL = 1, MODO_ANALOGICO = 2 };
 
-/** Un cambio de estado: en qué paso ocurre y cómo quedan todos los canales. */
+/**
+ * Un cambio de estado: en qué paso ocurre y cómo quedan todos los canales. La
+ * posición en float solo sirve para mostrar por dónde va; lo que dura cada
+ * fila se calcula en double al llegar (ver cmdFila), porque en una señal de
+ * millones de pasos un float ya no distingue fracciones de paso.
+ */
 struct Fila {
   float    pos;                          // paso, contando desde 0
   uint16_t mask;                         // bit i = canal i en alto
+};
+
+/** Un evento del streaming: lo que dura (en pasos) y cómo quedan los canales. */
+struct EventoFlujo {
+  float    dur;
+  uint16_t mask;
+  uint16_t libre;                        // relleno: 8 bytes, el búfer queda alineado
 };
 
 static Fila     filas[MAX_FILAS];
@@ -202,8 +266,14 @@ static Fila     filas[MAX_FILAS];
 static float    durFila[MAX_FILAS];
 static uint16_t nFilas        = 0;
 static float    pasosTotales  = 0;       // largo de una vuelta completa
+/** Lo mismo en double, y las posiciones de la primera y la última fila: dan las duraciones exactas. */
+static double   pasosTotalesD = 0;
+static double   posPrimeraD   = 0;
+static double   posUltimaD    = 0;
 
+#if HAY_ANALOGICAS
 static uint16_t muestras[MAX_CANALES_A][MAX_MUESTRAS];
+#endif
 static uint32_t nMuestras     = 0;       // por canal
 static uint8_t  spp           = 16;      // muestras por paso
 static uint32_t nivelMax      = 4095;    // fondo de escala de las muestras
@@ -216,18 +286,19 @@ static uint8_t  modo          = MODO_NADA;
 // ═══════════════════════════════════════════════════════════════════════════
 
 static volatile bool     corriendo      = false;
-static volatile bool     enMarcha       = false;   // la reproducción está adentro de un ciclo
+static volatile bool     enMarcha       = false;   // la reproducción está adentro de una vuelta
 static volatile bool     pedidoReinicio = false;
 
-static volatile uint32_t mv       = 3300;          // amplitud pedida
-static volatile uint32_t usPedido = 1000;          // microsegundos por paso
-static volatile uint32_t rpm      = 0;             // 0 = manda usPedido
 /**
- * Ciclos que trae la señal. Es un dato de la señal, igual que en el equipo de
- * SD: se guarda y se informa, pero no entra en el tiempo de paso (la fórmula
- * de las rpm no lo usa).
+ * Voltaje pedido desde la app, en milivoltios (0 a 99 990). El equipo no lo
+ * usa: se guarda y se informa en cada estado. Es el punto de partida para
+ * quien quiera darle un uso en su propio circuito.
  */
-static volatile uint32_t ciclosSenal = 2;
+static volatile uint32_t mv       = 3300;
+/** Microsegundos por paso, con decimales (la app manda baudios y bps así). */
+static volatile float    usPedido = 1000.0f;
+/** Vueltas de la señal por minuto, con decimales (Hz × 60). 0 = manda usPedido. */
+static volatile float    rpm      = 0.0f;
 /**
  * El tiempo de paso que se usa de verdad. Va con decimales: redondearlo al
  * microsegundo corría la señal hasta un 1 % a rpm altas, porque el error se
@@ -236,10 +307,22 @@ static volatile uint32_t ciclosSenal = 2;
  */
 static volatile float    usPaso   = 1000.0f;
 
-static volatile uint32_t ciclos    = 0;
+/** Vueltas completas de la señal desde el último reinicio. */
+static volatile uint32_t vueltas   = 0;
 static volatile float    posActual = 0;
 
-/** Factor de amplitud, en punto fijo: dac = muestra * factorQ16 >> 16. */
+// ── Streaming (señales que no entran en la memoria) ────────────────────────
+/** La señal cargada es larga y llega mientras suena. */
+static volatile bool     flujo           = false;
+static EventoFlujo*      anillo          = nullptr;
+static uint32_t          capAnillo       = 0;        // eventos, potencia de dos
+static volatile uint32_t cabeza          = 0;        // escribe la red (núcleo 0)
+static volatile uint32_t cola            = 0;        // lee la reproducción (núcleo 1)
+static volatile uint32_t faltas          = 0;        // veces que el búfer se vació sonando
+static uint32_t          recibidos       = 0;        // eventos llegados desde SBEGIN
+static uint32_t          eventosPorVuelta = 0;
+
+/** Nivel de la app a 8 bits del DAC, en punto fijo: dac = muestra * factorQ16 >> 16. */
 static volatile uint32_t factorQ16 = 0;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -257,36 +340,58 @@ static uint32_t gpioDe[256];
 static void armarTablaGpio() {
   for (uint16_t m = 0; m < 256; m++) {
     uint32_t bits = 0;
-    for (uint8_t i = 0; i < MAX_CANALES_D; i++) {
+    for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
       if (m & (1u << i)) bits |= (1UL << PINES[i]);   // todos los PINES son < 32
     }
     gpioDe[m] = bits;
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CANALES SIN PIN (9 A 16) — PARA TU CÓDIGO
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Valor actual de los canales que no tienen pin: bit 0 = canal 9, bit 7 =
+ * canal 16. Se actualiza en cada cambio de estado de la señal, igual que los
+ * pines, y vuelve a 0 cuando la señal para.
+ */
+static volatile uint8_t canalesExtra = 0;
+
+/**
+ * Se llama con cada cambio de estado, con los canales 9 a 16. Está vacía a
+ * propósito: es el lugar para sacarlos por donde haga falta (un expansor I2C,
+ * un 74HC595, otra placa). Corre dentro de la reproducción, en el núcleo 1:
+ * lo que se ponga acá tiene que ser corto o la señal pierde precisión.
+ */
+static inline void escribirCanalesExtra(uint8_t bits) {
+  (void)bits;
+}
+
 /** Pone los canales cargados como dice la máscara, todos juntos. */
 static inline void escribirMask(uint16_t m) {
-  const uint8_t cargados = (uint8_t)((1u << nCanales) - 1);
-  REG_WRITE(GPIO_OUT_W1TS_REG, gpioDe[m & cargados]);
-  REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[~m & cargados]);
+  const uint16_t cargados = (uint16_t)((1UL << nCanales) - 1);
+  const uint8_t  conPin   = (uint8_t)(cargados & 0xFF);
+  REG_WRITE(GPIO_OUT_W1TS_REG, gpioDe[m & conPin]);
+  REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[~m & conPin]);
+  if (nCanales > CANALES_CON_PIN) {
+    canalesExtra = (uint8_t)((m & cargados) >> CANALES_CON_PIN);
+    escribirCanalesExtra(canalesExtra);
+  }
 }
 
-/** Recalcula el factor de amplitud a partir del voltaje y la resolución. */
+/**
+ * Recalcula el factor que lleva la resolución de la señal a los 8 bits del
+ * DAC. Usa todo el rango: el voltaje no lo escala (ver `mv`).
+ */
 static void recalcularFactor() {
-  const uint64_t techo = (uint64_t)nivelMax * V_MAX_MV;
-  factorQ16 = techo == 0 ? 0 : (uint32_t)(((uint64_t)255 * mv * 65536ULL) / techo);
+  factorQ16 = nivelMax == 0 ? 0 : (uint32_t)(((uint64_t)255 * 65536ULL) / nivelMax);
 }
 
-/** Nivel de la app llevado a los 8 bits del DAC, con el voltaje ya aplicado. */
+/** Nivel de la app llevado a los 8 bits del DAC. */
 static inline uint8_t aDac(uint16_t nivel) {
   const uint32_t v = ((uint32_t)nivel * factorQ16) >> 16;
   return v > 255 ? 255 : (uint8_t)v;
-}
-
-/** Referencia continua del modo digital. */
-static void escribirReferencia() {
-  const uint32_t v = ((uint32_t)255 * mv) / V_MAX_MV;
-  dacWrite(PIN_REFERENCIA, v > 255 ? 255 : (uint8_t)v);
 }
 
 /** Todo abajo: es donde queda la señal cuando está parada. */
@@ -294,11 +399,13 @@ static void salidasIdle() {
   // Se barren TODOS los pines, no solo los canales cargados: puede quedar uno
   // en alto de una señal anterior con más canales que la de ahora.
   REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[0xFF]);
+  canalesExtra = 0;
+  escribirCanalesExtra(0);
+#if HAY_ANALOGICAS
   if (modo == MODO_ANALOGICO) {
     for (uint8_t c = 0; c < MAX_CANALES_A; c++) dacWrite(PINES_DAC[c], 0);
-  } else {
-    escribirReferencia();
   }
+#endif
 }
 
 /**
@@ -322,16 +429,16 @@ static void resolverRitmo() {
   usPaso = (float)us;
 }
 
-/** Prepara lo que la reproducción digital lee en cada fila. */
+/**
+ * Cierra lo que la reproducción digital lee en cada fila. Las duraciones de
+ * todas menos la última ya se calcularon al llegar (ver cmdFila).
+ */
 static void prepararFilas() {
-  for (uint16_t i = 0; i < nFilas; i++) {
-    float d = (i + 1 < nFilas)
-      ? filas[i + 1].pos - filas[i].pos
-      // La última se sostiene hasta el final de la vuelta y lo que falte hasta
-      // la primera fila de la vuelta siguiente.
-      : pasosTotales - filas[i].pos + filas[0].pos;
-    durFila[i] = d > 0 ? d : 0;
-  }
+  if (nFilas == 0) return;
+  // La última se sostiene hasta el final de la vuelta y lo que falte hasta
+  // la primera fila de la vuelta siguiente.
+  const double d = pasosTotalesD - posUltimaD + posPrimeraD;
+  durFila[nFilas - 1] = d > 0 ? (float)d : 0.0f;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -346,33 +453,102 @@ static void prepararFilas() {
 // frena la señal en el acto, como un motor, sin volver al principio.
 
 /**
- * Espera hasta el instante `t`, en microsegundos del reloj del micro.
- *
- * Devuelve false si mientras tanto pararon la señal o pidieron reiniciarla.
- * Cuando falta bastante cede el procesador; sobre el final gira en vacío, que
- * es la única forma de acertarle al microsegundo.
+ * Reloj de 64 bits en ciclos de CPU, para la reproducción (siempre en el
+ * núcleo 1; cada núcleo tiene su contador). El de 32 bits da la vuelta cada
+ * ~18 s a 240 MHz; mientras suena se lee mucho más seguido que eso.
  */
-static bool esperarHasta(int64_t t) {
+static uint32_t cicloAnterior = 0;
+static uint64_t ciclosAltos   = 0;
+static inline uint64_t ciclos64() {
+  const uint32_t c = (uint32_t)esp_cpu_get_cycle_count();
+  if (c < cicloAnterior) ciclosAltos += (1ULL << 32);
+  cicloAnterior = c;
+  return ciclosAltos | c;
+}
+
+/**
+ * Espera hasta el ciclo `t`.
+ *
+ * Devuelve false si mientras tanto pararon la señal o (cargada en memoria)
+ * pidieron reiniciarla. Cuando faltan más de 2 ms cede el procesador; sobre
+ * el final gira en vacío, que es la única forma de acertarle a fracciones de
+ * microsegundo.
+ */
+static bool esperarCiclos(uint64_t t, float ciclosPorUs) {
+  const int64_t umbral = (int64_t)(2000.0f * ciclosPorUs);
   while (true) {
-    if (!corriendo || pedidoReinicio) return false;
-    const int64_t falta = t - (int64_t)esp_timer_get_time();
+    if (!corriendo || (!flujo && pedidoReinicio)) return false;
+    const int64_t falta = (int64_t)(t - ciclos64());
     if (falta <= 0) return true;
-    if (falta > 2000) vTaskDelay(1);
+    if (falta > umbral) vTaskDelay(1);
   }
 }
 
+/*
+ * El instante ideal va en ciclos × 65536 (16 bits de fracción) y en enteros:
+ * el ESP32 no tiene coma flotante de hardware para double, y con double el
+ * bucle no llegaba a pasos de pocos µs. Se suma lo que dura cada evento con
+ * una sola multiplicación float y se redondea solo el plazo, nunca lo que se
+ * acumula.
+ */
 static void reproducirDigital() {
-  double ideal = (double)esp_timer_get_time();
+  const float ciclosPorUs = (float)getCpuFrequencyMhz();
+  uint64_t idealQ = ciclos64() << 16;
+  float    ultimoPaso = -1.0f, pasoQ = 0.0f;
   uint16_t i = 0;
 
   while (corriendo) {
     escribirMask(filas[i].mask);
-    posActual = filas[i].pos;
+    posActual = (float)filas[i].pos;
 
-    ideal += (double)durFila[i] * (double)usPaso;
-    if (!esperarHasta((int64_t)(ideal + 0.5))) return;
+    const float us = usPaso;                     // se lee una vez: cambia en vivo
+    if (us != ultimoPaso) { ultimoPaso = us; pasoQ = us * ciclosPorUs * 65536.0f; }
+    idealQ += (uint64_t)(durFila[i] * pasoQ + 0.5f);
+    if (!esperarCiclos((idealQ + 32768) >> 16, ciclosPorUs)) return;
 
-    if (++i >= nFilas) { i = 0; ciclos = ciclos + 1; }
+    if (++i >= nFilas) { i = 0; vueltas = vueltas + 1; }
+  }
+}
+
+/**
+ * Una señal larga, desde el búfer que la app va llenando. Igual que la de
+ * memoria, pero cada evento ya trae lo que dura. Si el búfer se vacía (el
+ * enlace no llegó a tiempo), la salida se sostiene, se cuenta una falta y el
+ * reloj vuelve a arrancar desde ese momento, sin ráfagas para alcanzar.
+ * "Reiniciar" no puede volver atrás acá: la app manda la señal de nuevo.
+ */
+static void reproducirFlujo() {
+  const float ciclosPorUs = (float)getCpuFrequencyMhz();
+  uint64_t idealQ = ciclos64() << 16;
+  float    ultimoPaso = -1.0f, pasoQ = 0.0f;
+  uint32_t enVuelta = 0;
+  double   posVuelta = 0;
+
+  while (corriendo) {
+    if (pedidoReinicio) {
+      pedidoReinicio = false;
+      vueltas = 0;
+    }
+    if (cola == cabeza) {
+      faltas = faltas + 1;
+      while (corriendo && cola == cabeza) { }
+      if (!corriendo) return;
+      idealQ = ciclos64() << 16;
+      continue;
+    }
+    const EventoFlujo e = anillo[cola & (capAnillo - 1)];
+    __sync_synchronize();
+    cola = cola + 1;
+
+    escribirMask(e.mask);
+    posActual = (float)posVuelta;
+    posVuelta += e.dur;
+    if (++enVuelta >= eventosPorVuelta) { enVuelta = 0; posVuelta = 0; vueltas = vueltas + 1; }
+
+    const float us = usPaso;
+    if (us != ultimoPaso) { ultimoPaso = us; pasoQ = us * ciclosPorUs * 65536.0f; }
+    idealQ += (uint64_t)(e.dur * pasoQ + 0.5f);
+    if (!esperarCiclos((idealQ + 32768) >> 16, ciclosPorUs)) return;
   }
 }
 
@@ -397,13 +573,15 @@ static void reproducirAnalogico() {
     const int64_t ahora = esp_timer_get_time();
     m += (double)(ahora - antes) / usMuestra;
     antes = ahora;
-    while (m >= (double)nMuestras) { m -= (double)nMuestras; ciclos = ciclos + 1; }
+    while (m >= (double)nMuestras) { m -= (double)nMuestras; vueltas = vueltas + 1; }
 
     const uint32_t i = (uint32_t)m;
     if (i != ultima) {
+#if HAY_ANALOGICAS
       for (uint8_t c = 0; c < nCanales && c < MAX_CANALES_A; c++) {
         dacWrite(PINES_DAC[c], aDac(muestras[c][i]));
       }
+#endif
       ultima = i;
       posActual = (float)i / (float)spp;
     }
@@ -415,7 +593,7 @@ static void reproducirAnalogico() {
 static void tareaReproduccion(void*) {
   for (;;) {
     const bool hayQue = corriendo && modo != MODO_NADA &&
-                        ((modo == MODO_DIGITAL && nFilas > 0) ||
+                        ((modo == MODO_DIGITAL && (flujo ? anillo != nullptr : nFilas > 0)) ||
                          (modo == MODO_ANALOGICO && nMuestras > 0));
     if (!hayQue) {
       if (enMarcha) { salidasIdle(); enMarcha = false; }
@@ -424,11 +602,11 @@ static void tareaReproduccion(void*) {
     }
     if (pedidoReinicio) {
       pedidoReinicio = false;
-      ciclos = 0;
+      vueltas = 0;
       posActual = 0;
     }
     enMarcha = true;
-    if (modo == MODO_DIGITAL) reproducirDigital();
+    if (modo == MODO_DIGITAL) { if (flujo) reproducirFlujo(); else reproducirDigital(); }
     else                      reproducirAnalogico();
   }
 }
@@ -541,22 +719,6 @@ static void base64Encode(const uint8_t* in, size_t len, char* out) {
 /** Sufijo fijo que exige el protocolo antes de firmar la clave del cliente. */
 static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/** Lee exactamente `n` bytes, o devuelve false si el cliente se calló. */
-static bool wsReadN(WiFiClient& c, uint8_t* dst, size_t n, uint32_t timeoutMs) {
-  uint32_t t0 = millis();
-  size_t leidos = 0;
-  while (leidos < n) {
-    if (c.available() > 0) {
-      int r = c.read(dst + leidos, n - leidos);
-      if (r > 0) { leidos += r; t0 = millis(); continue; }
-    }
-    if (!c.connected() && c.available() == 0) return false;
-    if (millis() - t0 > timeoutMs) return false;
-    delay(1);
-  }
-  return true;
-}
-
 /** Manda una trama de texto sin enmascarar (servidor → cliente). */
 static bool wsSendText(WiFiClient& c, const char* texto, size_t len) {
   if (!c.connected()) return false;
@@ -573,6 +735,14 @@ static bool wsSendText(WiFiClient& c, const char* texto, size_t len) {
     cab[n++] = 127;
     for (int8_t i = 7; i >= 0; i--) cab[n++] = (uint8_t)((uint64_t)len >> (i * 8));
   }
+  // Lo corto (estado, créditos) sale en un solo paquete: con la cabecera
+  // aparte serían dos, 40 veces por segundo durante el streaming
+  if (len <= 240) {
+    uint8_t junto[250];
+    memcpy(junto, cab, n);
+    memcpy(junto + n, texto, len);
+    return c.write(junto, n + len) == n + len;
+  }
   if (c.write(cab, n) != n) return false;
   return c.write((const uint8_t*)texto, len) == len;
 }
@@ -582,7 +752,48 @@ static bool wsSendText(WiFiClient& c, const char* texto) {
 }
 
 /**
- * Lee una trama si hay una esperando.
+ * Una trama a medio leer. La lectura nunca espera bytes que todavía no
+ * llegaron: toma lo que haya y sigue en la próxima vuelta. Así la tarea de red
+ * sigue mandando el estado y los créditos del streaming aunque un mensaje
+ * largo llegue de a pedazos por un WiFi con interferencias; antes se quedaba
+ * esperando el resto y, si tardaba, cortaba el enlace.
+ */
+static struct {
+  uint8_t  cab[14];        // 2 fijos + hasta 8 de largo + 4 de máscara
+  uint8_t  nCab;           // cuántos de la cabecera llegaron
+  uint8_t  largoCab;       // cuántos hacen falta (se sabe con los 2 primeros)
+  bool     enCuerpo;
+  bool     fin, mask, cabe;
+  uint8_t  op;
+  uint8_t  clave[4];
+  uint64_t len, leidos;
+  size_t   escrito;
+  uint32_t desde;          // último byte que llegó de esta trama
+} lws;
+
+/** Una trama empezada que no avanza en este plazo es una conexión muerta. */
+static const uint32_t PLAZO_TRAMA_MS = 10000;
+
+/** Por qué se cortó el último enlace WiFi, para el monitor serie. */
+static const char* motivoCierreWs = "";
+
+static void reiniciarLecturaWs() {
+  lws.nCab = 0;
+  lws.enCuerpo = false;
+}
+
+/** No llegó nada nuevo: sigue esperando, salvo que la trama lleve demasiado parada. */
+static WsRead wsSinDatos() {
+  if (lws.nCab == 0 && !lws.enCuerpo) return WS_NADA;
+  if (millis() - lws.desde > PLAZO_TRAMA_MS) {
+    motivoCierreWs = "una trama quedó a medias más de 10 s";
+    return WS_CERRAR;
+  }
+  return WS_NADA;
+}
+
+/**
+ * Lee lo que haya de la trama en curso.
  *
  * Las de control (ping · pong · close) se resuelven acá adentro: el que llama
  * solo se entera del texto. Un mensaje partido en varias tramas se va juntando
@@ -590,63 +801,85 @@ static bool wsSendText(WiFiClient& c, const char* texto) {
  * acumulado hasta ahora y sale actualizado.
  */
 static WsRead wsReadText(WiFiClient& c, char* dst, size_t cap, size_t& largo) {
-  if (!c.connected() && c.available() == 0) return WS_CERRAR;
-  if (c.available() < 2) return WS_NADA;
-
-  uint8_t cab[2];
-  if (!wsReadN(c, cab, 2, 2000)) return WS_CERRAR;
-
-  const bool    fin  = (cab[0] & 0x80) != 0;
-  const uint8_t op   = cab[0] & 0x0F;
-  const bool    mask = (cab[1] & 0x80) != 0;
-  uint64_t      len  = cab[1] & 0x7F;
-
-  if (len == 126) {
-    uint8_t ext[2];
-    if (!wsReadN(c, ext, 2, 2000)) return WS_CERRAR;
-    len = ((uint64_t)ext[0] << 8) | ext[1];
-  } else if (len == 127) {
-    uint8_t ext[8];
-    if (!wsReadN(c, ext, 8, 2000)) return WS_CERRAR;
-    len = 0;
-    for (uint8_t i = 0; i < 8; i++) len = (len << 8) | ext[i];
+  if (!c.connected() && c.available() == 0) {
+    motivoCierreWs = "la conexión se cerró del otro lado";
+    return WS_CERRAR;
   }
 
-  uint8_t clave[4] = { 0, 0, 0, 0 };
-  if (mask && !wsReadN(c, clave, 4, 2000)) return WS_CERRAR;
-
-  if (op == 0x8) return WS_CERRAR;       // close
-
-  /* Un mensaje más grande que el buffer se lee igual y se tira: cortar la
-     conexión a la mitad de una trama dejaría el stream sin sincronizar. */
-  const bool cabe = (largo + (size_t)len) < cap;
-  size_t escrito = largo;
-  uint8_t trozo[64];
-  uint64_t leidos = 0;
-  while (leidos < len) {
-    const size_t n = (size_t)min<uint64_t>(len - leidos, sizeof(trozo));
-    if (!wsReadN(c, trozo, n, 2000)) return WS_CERRAR;
-    if (cabe) {
-      for (size_t i = 0; i < n; i++) {
-        dst[escrito + i] = (char)(mask ? (trozo[i] ^ clave[(size_t)(leidos + i) & 3])
-                                       : trozo[i]);
+  if (!lws.enCuerpo) {
+    if (lws.nCab == 0) lws.largoCab = 2;
+    while (lws.nCab < lws.largoCab) {
+      if (c.available() <= 0) return wsSinDatos();
+      const int r = c.read(lws.cab + lws.nCab, lws.largoCab - lws.nCab);
+      if (r <= 0) return wsSinDatos();
+      if (lws.nCab == 0) lws.desde = millis();
+      lws.nCab += r;
+      lws.desde = millis();
+      if (lws.nCab == 2 && lws.largoCab == 2) {
+        const uint8_t l7 = lws.cab[1] & 0x7F;
+        lws.largoCab = 2 + (l7 == 126 ? 2 : l7 == 127 ? 8 : 0) + ((lws.cab[1] & 0x80) ? 4 : 0);
       }
-      escrito += n;
     }
-    leidos += n;
+    lws.fin  = (lws.cab[0] & 0x80) != 0;
+    lws.op   = lws.cab[0] & 0x0F;
+    lws.mask = (lws.cab[1] & 0x80) != 0;
+    uint8_t k = 2;
+    const uint8_t l7 = lws.cab[1] & 0x7F;
+    if (l7 == 126) {
+      lws.len = ((uint64_t)lws.cab[2] << 8) | lws.cab[3];
+      k = 4;
+    } else if (l7 == 127) {
+      lws.len = 0;
+      for (uint8_t i = 0; i < 8; i++) lws.len = (lws.len << 8) | lws.cab[2 + i];
+      k = 10;
+    } else {
+      lws.len = l7;
+    }
+    for (uint8_t i = 0; i < 4; i++) lws.clave[i] = lws.mask ? lws.cab[k + i] : 0;
+    lws.enCuerpo = true;
+    lws.leidos   = 0;
+    /* Un mensaje más grande que el buffer se lee igual y se tira: cortar la
+       conexión a la mitad de una trama dejaría el stream sin sincronizar. */
+    lws.cabe     = (largo + (size_t)lws.len) < cap;
+    lws.escrito  = largo;
   }
-  if (cabe) largo = escrito;
 
-  if (op == 0x9) {                        // ping → pong sin cuerpo
+  uint8_t trozo[256];
+  while (lws.leidos < lws.len) {
+    const int disp = c.available();
+    if (disp <= 0) return wsSinDatos();
+    size_t n = (size_t)min<uint64_t>(lws.len - lws.leidos, sizeof(trozo));
+    if (n > (size_t)disp) n = (size_t)disp;
+    const int r = c.read(trozo, n);
+    if (r <= 0) return wsSinDatos();
+    if (lws.cabe) {
+      for (int i = 0; i < r; i++) {
+        dst[lws.escrito + i] = (char)(trozo[i] ^ lws.clave[(size_t)(lws.leidos + i) & 3]);
+      }
+      lws.escrito += r;
+    }
+    lws.leidos += r;
+    lws.desde = millis();
+  }
+
+  // La trama llegó entera
+  reiniciarLecturaWs();
+  if (lws.cabe) largo = lws.escrito;
+
+  if (lws.op == 0x8) {                    // close
+    motivoCierreWs = "la app cerró el enlace";
+    return WS_CERRAR;
+  }
+  if (lws.op == 0x9) {                    // ping → pong sin cuerpo
     const uint8_t pong[2] = { 0x8A, 0x00 };
     c.write(pong, 2);
     largo = 0;
     return WS_NADA;
   }
-  if (op == 0xA) { largo = 0; return WS_NADA; }   // pong suelto
+  if (lws.op == 0xA) { largo = 0; return WS_NADA; }   // pong suelto
 
-  if (!fin) return WS_NADA;               // sigue en la trama que viene
-  if (!cabe) { largo = 0; return WS_NADA; }
+  if (!lws.fin) return WS_NADA;           // sigue en la trama que viene
+  if (!lws.cabe) { largo = 0; return WS_NADA; }
   dst[largo] = '\0';
   return WS_TEXTO;
 }
@@ -1107,8 +1340,24 @@ static size_t rxLargo = 0;
 /** Enlace por cable: se enciende con la primera orden y se apaga por silencio. */
 static bool     enlaceSerie  = false;
 static uint32_t ultimaSerie  = 0;
-static char     rxSerie[512];
-static size_t   rxSerieLargo = 0;
+
+/**
+ * Puertos por los que puede hablar la app. Con "USB CDC On Boot" (así se
+ * compila el S3) `Serial` es el USB nativo y `Serial0` el UART del conversor:
+ * se escuchan los dos, así sirve cualquiera de los conectores de la placa. En
+ * el ESP32 clásico hay uno solo.
+ */
+#if ARDUINO_USB_CDC_ON_BOOT
+static Stream* const PUERTOS[] = { &Serial, &Serial0 };
+#else
+static Stream* const PUERTOS[] = { &Serial };
+#endif
+static const uint8_t N_PUERTOS = sizeof(PUERTOS) / sizeof(PUERTOS[0]);
+
+/** El puerto por el que llegó la última orden: las respuestas vuelven por ahí. */
+static Stream*  puertoEnlace = PUERTOS[0];
+static char     rxSerie[N_PUERTOS][1100];   // una tanda "S" en base64 son ~520
+static size_t   rxSerieLargo[N_PUERTOS] = {};
 
 /** Carga a medio recibir: entre BEGIN y END. */
 static bool     cargando    = false;
@@ -1127,14 +1376,18 @@ static void nota(const char* fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  Serial.print(F("# "));
-  Serial.println(buf);
+  for (uint8_t k = 0; k < N_PUERTOS; k++) {
+    PUERTOS[k]->print(F("# "));
+    PUERTOS[k]->println(buf);
+  }
 }
 
 /** Respuesta para quien esté escuchando, sea por WiFi o por cable. */
 static void decir(const char* linea) {
-  if (wsAbierto)   wsSendText(clienteWs, linea);
-  if (enlaceSerie) { Serial.print(linea); Serial.print('\n'); }
+  if (wsAbierto && !wsSendText(clienteWs, linea) && !clienteWs.connected()) {
+    motivoCierreWs = "no se pudo mandar (la red no respondió)";
+  }
+  if (enlaceSerie) { puertoEnlace->print(linea); puertoEnlace->print('\n'); }
 }
 
 static void decirf(const char* fmt, ...) {
@@ -1147,24 +1400,153 @@ static void decirf(const char* fmt, ...) {
 }
 
 static void mandarEstado() {
-  decirf("STATE %u %.3f %u %u %.3f %u %u %u %u",
+  decirf("STATE %u %.3f %u %u %.3f %.3f %u %u",
          corriendo ? 1u : 0u,
          posActual,
-         ciclos,
+         vueltas,
          mv,
          (double)usPaso,
-         rpm,
-         modo == MODO_DIGITAL ? (uint32_t)nFilas : nMuestras,
-         (uint32_t)modo,
-         ciclosSenal);
+         (double)rpm,
+         modo == MODO_DIGITAL ? (flujo ? eventosPorVuelta : (uint32_t)nFilas) : nMuestras,
+         (uint32_t)modo);
 }
 
 static void mandarSaludo() {
-  decirf("READY %u %s %u %u %u %u %u",
+  // Los pines de cada canal, separados por comas, para que la app diga por
+  // dónde sale cada uno sin tener que conocer la placa. Sin analógicas va un
+  // guion: un campo vacío se perdería entre los espacios.
+  char pd[48] = "", pa[16] = "-";
+  for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
+    const size_t n = strlen(pd);
+    snprintf(pd + n, sizeof(pd) - n, i ? ",%u" : "%u", (unsigned)PINES[i]);
+  }
+#if HAY_ANALOGICAS
+  pa[0] = '\0';
+  for (uint8_t i = 0; i < MAX_CANALES_A; i++) {
+    const size_t n = strlen(pa);
+    snprintf(pa + n, sizeof(pa) - n, i ? ",%u" : "%u", (unsigned)PINES_DAC[i]);
+  }
+#endif
+  // El chip, los pines y el búfer de streaming van al final: una app anterior
+  // lee solo los primeros campos y no se entera.
+  decirf("READY %u %s %u %u %u %u %u %s %s %s %u",
          (uint32_t)PROTO, nombreEquipo,
          (uint32_t)MAX_CANALES_D, (uint32_t)MAX_CANALES_A,
          (uint32_t)MAX_FILAS, (uint32_t)MAX_MUESTRAS,
-         V_MAX_MV);
+         V_MAX_MV, CHIP, pd, pa,
+         anillo ? capAnillo : capacidadAnillo());
+}
+
+// ── Streaming ──────────────────────────────────────────────────────────────
+//
+// SBEGIN <canales> <pasos> <eventosPorVuelta>   para todo y arma el búfer
+// S <base64>      eventos de 6 bytes: float32 duración en pasos, uint16 máscara
+// SPRIMED         la app terminó de cebar el búfer: se contesta LOADED
+// Mientras dura, el equipo informa cada 25 ms SFREE <libres> <recibidos> <faltas>:
+// la app nunca manda más de lo que entra (lo que viaja se descuenta).
+
+/** Lo que se le deja al resto (WiFi, conexiones) al armar el búfer. */
+static const uint32_t RESERVA_HEAP = 48 * 1024;
+
+/** El búfer más grande que entra ahora: potencia de dos, de 1024 a 32 768 eventos. */
+static uint32_t capacidadAnillo() {
+  uint32_t libre = ESP.getFreeHeap();
+  libre = libre > RESERVA_HEAP ? libre - RESERVA_HEAP : 0;
+  const uint32_t bloque = ESP.getMaxAllocHeap();
+  if (bloque < libre) libre = bloque;
+  uint32_t cap = 32768;
+  while (cap >= 1024 && cap * sizeof(EventoFlujo) > libre) cap >>= 1;
+  return cap >= 1024 ? cap : 0;
+}
+
+/** Suelta el búfer (con la reproducción ya parada). */
+static void liberarAnillo() {
+  if (anillo) { free(anillo); anillo = nullptr; }
+  capAnillo = 0;
+  flujo = false;
+}
+
+static int valorBase64(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+/** Decodifica base64 en `out`; devuelve los bytes escritos. */
+static size_t decodificarBase64(const char* in, uint8_t* out, size_t cap) {
+  uint32_t acc = 0;
+  int bits = 0;
+  size_t n = 0;
+  for (; *in && *in != '='; in++) {
+    const int v = valorBase64(*in);
+    if (v < 0) continue;
+    acc = (acc << 6) | (uint32_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n < cap) out[n++] = (uint8_t)(acc >> bits);
+    }
+  }
+  return n;
+}
+
+static void cmdSBegin(char* args) {
+  char* resto = nullptr;
+  const char* sCan = strtok_r(args, " ", &resto);
+  const char* sPas = strtok_r(nullptr, " ", &resto);
+  const char* sEv  = strtok_r(nullptr, " ", &resto);
+  if (!sCan || !sPas || !sEv) { decir("ERR SBEGIN incompleto"); return; }
+
+  detenerYEsperar();
+  liberarAnillo();
+  uint8_t canales = (uint8_t)atoi(sCan);
+  if (canales == 0) { decir("ERR sin canales"); return; }
+  if (canales > MAX_CANALES_D) canales = MAX_CANALES_D;
+
+  const uint32_t cap = capacidadAnillo();
+  anillo = cap ? (EventoFlujo*)malloc(cap * sizeof(EventoFlujo)) : nullptr;
+  if (!anillo) { decir("ERR no hay memoria para el búfer"); return; }
+  capAnillo        = cap;
+  cabeza           = 0;
+  cola             = 0;
+  faltas           = 0;
+  recibidos        = 0;
+  eventosPorVuelta = strtoul(sEv, nullptr, 10);
+  if (eventosPorVuelta == 0) eventosPorVuelta = 1;
+
+  modo         = MODO_DIGITAL;
+  flujo        = true;
+  nCanales     = canales;
+  pasosTotales = (float)atof(sPas);
+  nFilas       = 0;
+  nMuestras    = 0;
+  vueltas      = 0;
+  posActual    = 0;
+  cargando     = false;
+  resolverRitmo();
+  salidasIdle();
+  decirf("SREADY %u", capAnillo);
+}
+
+/** Una tanda de eventos en base64. Lo que no entra se descarta y se avisa. */
+static void cmdS(char* args) {
+  if (!flujo || !anillo || !args) return;
+  uint8_t crudo[784];                   // una línea de hasta ~1040 caracteres base64
+  const size_t n = decodificarBase64(args, crudo, sizeof(crudo)) / 6;
+  uint32_t perdidos = 0;
+  for (size_t k = 0; k < n; k++) {
+    if (cabeza - cola >= capAnillo) { perdidos++; continue; }
+    EventoFlujo& e = anillo[cabeza & (capAnillo - 1)];
+    memcpy(&e.dur, crudo + k * 6, 4);
+    e.mask = (uint16_t)(crudo[k * 6 + 4] | (crudo[k * 6 + 5] << 8));
+    __sync_synchronize();                // el evento queda escrito antes de publicarlo
+    cabeza = cabeza + 1;
+  }
+  recibidos += n;
+  if (perdidos) decirf("ERR el búfer estaba lleno: %u eventos perdidos", perdidos);
 }
 
 // ── Comandos ───────────────────────────────────────────────────────────────
@@ -1179,24 +1561,28 @@ static void cmdBegin(char* args) {
   const char* sSpp  = strtok_r(nullptr, " ", &resto);
   if (!tipo || !sCan || !sPas) { decir("ERR BEGIN incompleto"); return; }
 
-  detenerYEsperar();
-
   const uint8_t nuevoModo = (tipo[0] == 'A') ? MODO_ANALOGICO : MODO_DIGITAL;
   const uint8_t tope = nuevoModo == MODO_ANALOGICO ? MAX_CANALES_A : MAX_CANALES_D;
+  // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí
+  if (tope == 0) { decir("ERR este equipo no tiene salidas analógicas"); return; }
+
+  detenerYEsperar();
+  liberarAnillo();                       // una señal que entra en memoria deja el streaming
   uint8_t canales = (uint8_t)atoi(sCan);
   if (canales == 0) { decir("ERR sin canales"); return; }
   if (canales > tope) canales = tope;
 
   modo         = nuevoModo;
   nCanales     = canales;
-  pasosTotales = (float)atof(sPas);
+  pasosTotalesD = atof(sPas);
+  pasosTotales = (float)pasosTotalesD;
   nivelMax     = sBits ? ((1UL << (uint8_t)atoi(sBits)) - 1) : 4095;
   spp          = sSpp ? (uint8_t)atoi(sSpp) : 16;
   if (spp == 0) spp = 1;
   nFilas       = 0;
   nMuestras    = 0;
   filasVistas  = 0;
-  ciclos       = 0;
+  vueltas      = 0;
   posActual    = 0;
   cargando     = true;
   recalcularFactor();
@@ -1212,13 +1598,23 @@ static void cmdFila(char* args) {
   if (!sPos || !sMask) return;
   filasVistas++;
   if (nFilas >= MAX_FILAS) return;
-  filas[nFilas].pos  = (float)atof(sPos);
+  const double p = atof(sPos);
+  if (nFilas == 0) posPrimeraD = p;
+  else {
+    const double d = p - posUltimaD;     // lo que dura la fila anterior, en double
+    durFila[nFilas - 1] = d > 0 ? (float)d : 0.0f;
+  }
+  posUltimaD = p;
+  filas[nFilas].pos  = (float)p;
   filas[nFilas].mask = (uint16_t)strtoul(sMask, nullptr, 10);
   nFilas++;
 }
 
 /** Un tramo de muestras: A <canal> <indice> <v,v,v,…> */
 static void cmdMuestras(char* args) {
+#if !HAY_ANALOGICAS
+  (void)args;                             // sin salidas analógicas no hay dónde guardarlas
+#else
   if (!cargando || modo != MODO_ANALOGICO) return;
   char* resto = nullptr;
   const char* sCan = strtok_r(args, " ", &resto);
@@ -1236,6 +1632,7 @@ static void cmdMuestras(char* args) {
     i++;
     if (i > nMuestras) nMuestras = i > MAX_MUESTRAS ? MAX_MUESTRAS : i;
   }
+#endif
 }
 
 /** Cierra la carga: END <filas esperadas> */
@@ -1261,31 +1658,33 @@ static void cmdEnd(char* args) {
   mandarEstado();
 }
 
-/** Parámetros: SET V <mv> · SET T <us> · SET R <rpm> · SET C <ciclos> */
+/**
+ * Parámetros: SET V <mV> · SET T <µs por paso> · SET R <rpm>. T y R aceptan
+ * decimales: la app pasa baudios, bps y Hz a una de las dos.
+ */
 static void cmdSet(char* args) {
   char* resto = nullptr;
   const char* que = strtok_r(args, " ", &resto);
   const char* val = strtok_r(nullptr, " ", &resto);
   if (!que || !val) { decir("ERR SET incompleto"); return; }
-  const uint32_t v = strtoul(val, nullptr, 10);
+  const double v = strtod(val, nullptr);
 
   switch (que[0]) {
     case 'V':
-      mv = v > V_MAX_MV ? V_MAX_MV : v;
-      recalcularFactor();
-      if (modo != MODO_ANALOGICO) escribirReferencia();
+      // Solo se guarda: ver `mv`
+      mv = v <= 0 ? 0 : (v > V_MAX_MV ? V_MAX_MV : (uint32_t)(v + 0.5));
       break;
     case 'T':
-      usPedido = v < 5 ? 5 : v;
+      usPedido = v < US_MIN ? US_MIN : (float)v;
       resolverRitmo();
       break;
     case 'R':
-      rpm = v > RPM_MAX ? RPM_MAX : v;
+      rpm = v <= 0 ? 0.0f : (v > RPM_MAX ? RPM_MAX : (float)v);
       resolverRitmo();
       break;
     case 'C':
-      ciclosSenal = v < CICLOS_MIN ? CICLOS_MIN : (v > CICLOS_MAX ? CICLOS_MAX : v);
-      break;
+      // Una app anterior manda los ciclos de la señal, que ya no existen
+      return;
     default:
       decir("ERR parámetro desconocido");
       return;
@@ -1300,7 +1699,14 @@ static void procesarLinea(char* linea) {
   char* args = strchr(linea, ' ');
   if (args) { *args = '\0'; args++; }
 
-  if      (!strcmp(linea, "D"))     cmdFila(args);
+  if      (!strcmp(linea, "S"))     cmdS(args);
+  else if (!strcmp(linea, "D"))     cmdFila(args);
+  else if (!strcmp(linea, "SBEGIN")) cmdSBegin(args);
+  else if (!strcmp(linea, "SPRIMED")) {
+    if (!flujo) { decir("ERR no hay streaming en curso"); return; }
+    decirf("LOADED %u", eventosPorVuelta);
+    mandarEstado();
+  }
   else if (!strcmp(linea, "A"))     cmdMuestras(args);
   else if (!strcmp(linea, "BEGIN")) cmdBegin(args);
   else if (!strcmp(linea, "END"))   cmdEnd(args);
@@ -1320,7 +1726,7 @@ static void procesarLinea(char* linea) {
   }
   else if (!strcmp(linea, "RESET")) {
     pedidoReinicio = true;
-    ciclos = 0;
+    vueltas = 0;
     posActual = 0;
     if (!corriendo) salidasIdle();
     mandarEstado();
@@ -1347,28 +1753,34 @@ static void procesarMensaje(char* texto) {
  * lugar donde esperarlos.
  */
 static void atenderSerie() {
-  while (Serial.available()) {
-    const char ch = (char)Serial.read();
-    if (ch == '\r') continue;
-    if (ch == '\n') {
-      if (rxSerieLargo > 0) {
-        rxSerie[rxSerieLargo] = '\0';
-        rxSerieLargo = 0;
-        enlaceSerie = true;
-        ultimaSerie = millis();
-        procesarLinea(rxSerie);
+  for (uint8_t k = 0; k < N_PUERTOS; k++) {
+    Stream* const puerto = PUERTOS[k];
+    char* const   buf    = rxSerie[k];
+    size_t&       largo  = rxSerieLargo[k];
+    while (puerto->available()) {
+      const char ch = (char)puerto->read();
+      if (ch == '\r') continue;
+      if (ch == '\n') {
+        if (largo > 0) {
+          buf[largo] = '\0';
+          largo = 0;
+          enlaceSerie = true;
+          ultimaSerie = millis();
+          puertoEnlace = puerto;
+          procesarLinea(buf);
+        }
+        continue;
       }
-      continue;
+      if (largo < sizeof(rxSerie[0]) - 1) buf[largo++] = ch;
+      else largo = 0;                      // línea imposible: se descarta entera
     }
-    if (rxSerieLargo < sizeof(rxSerie) - 1) rxSerie[rxSerieLargo++] = ch;
-    else rxSerieLargo = 0;                 // línea imposible: se descarta entera
   }
 
   // La app manda un PING cada dos segundos. Si dejó de llegar, cerraron la
   // pestaña o desenchufaron: la señal se para, igual que al caerse el WiFi.
   if (enlaceSerie && millis() - ultimaSerie > SILENCIO_SERIE_MS) {
     enlaceSerie = false;
-    rxSerieLargo = 0;
+    for (uint8_t k = 0; k < N_PUERTOS; k++) rxSerieLargo[k] = 0;
     cargando = false;
     detenerYEsperar();
     salidasIdle();
@@ -2005,11 +2417,13 @@ static void cerrarWs() {
   clienteWs.stop();
   wsAbierto = false;
   rxLargo = 0;
+  reiniciarLecturaWs();
   cargando = false;
   // Si se cae el enlace la señal se para: nadie quedaría para pararla.
   detenerYEsperar();
   salidasIdle();
-  nota("Enlace WiFi cerrado");
+  nota("Enlace WiFi cerrado: %s", motivoCierreWs);
+  motivoCierreWs = "";
 }
 
 static void atenderWs() {
@@ -2020,6 +2434,7 @@ static void atenderWs() {
       clienteWs = nuevo;
       wsAbierto = true;
       rxLargo = 0;
+      reiniciarLecturaWs();
       nota("Enlace WiFi abierto");
       mandarSaludo();
       mandarEstado();
@@ -2040,6 +2455,7 @@ static void atenderWs() {
 
 static void tareaRed(void*) {
   uint32_t ultimoEstado = 0;
+  uint32_t ultimoLibre  = 0;
   for (;;) {
     // El puerto serie se atiende dos veces por vuelta: es el único enlace sin
     // control de flujo, así que su buffer no puede esperar a que termine todo
@@ -2054,6 +2470,11 @@ static void tareaRed(void*) {
     if ((wsAbierto || enlaceSerie) && millis() - ultimoEstado > 250) {
       ultimoEstado = millis();
       mandarEstado();
+    }
+    // Créditos del streaming: cuánto lugar hay y cuánto llegó
+    if (flujo && anillo && (wsAbierto || enlaceSerie) && millis() - ultimoLibre >= 25) {
+      ultimoLibre = millis();
+      decirf("SFREE %u %u %u", capAnillo - (cabeza - cola), recibidos, faltas);
     }
     vTaskDelay(1);
   }
@@ -2075,26 +2496,29 @@ static void unirseARedGuardada() {
     return;
   }
 
-  // Se espera acá mismo para que el saludo del monitor serie ya diga en qué
-  // dirección quedó. Lo que pase después lo sigue vigilarRed().
+  // No se espera acá: abrir el puerto USB reinicia la placa y la app saluda
+  // enseguida; si el arranque se quedara hasta 12 s esperando al router, la
+  // app creería que es un firmware anterior y probaría otra velocidad. La
+  // entrada la sigue vigilarRed(), que avisa la dirección cuando la tiene.
   nota("Uniéndose a %s…", staSsid.c_str());
   entrarARed();
-  while (WiFi.status() != WL_CONNECTED && millis() - faseDesde < PLAZO_RED_MS) delay(200);
-  vigilarRed();
 }
 
 void setup() {
   Serial.setRxBufferSize(RX_SERIE);
   Serial.begin(BAUDIOS);
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial0.setRxBufferSize(RX_SERIE);
+  Serial0.begin(BAUDIOS);
+#endif
   delay(200);
 
   armarTablaGpio();
-  for (uint8_t i = 0; i < MAX_CANALES_D; i++) {
+  for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
     pinMode(PINES[i], OUTPUT);
     digitalWrite(PINES[i], LOW);
   }
   recalcularFactor();
-  escribirReferencia();
 
   // Nombre propio con los dos últimos bytes de la MAC: no cambia nunca y no
   // se repite entre equipos, que es lo que hace falta para tener varios juntos.
@@ -2140,15 +2564,11 @@ void setup() {
   servidorWs.setNoDelay(true);
 
   nota("");
-  nota("Oryx Signal · generador ESP32");
+  nota("Oryx Signal · generador %s", CHIP);
   nota("Equipo    : %s", nombreEquipo);
   nota("USB       : este mismo puerto, a %u baudios", BAUDIOS);
   nota("Red propia: %s / %s", nombreEquipo, AP_CLAVE);
   nota("Portal    : http://%s/", WiFi.softAPIP().toString().c_str());
-  if (faseRed == RED_ADENTRO) {
-    nota("En tu red : http://%s/  ·  http://%s.local/",
-         WiFi.localIP().toString().c_str(), MDNS_NOMBRE);
-  }
 
   /* El bucle de espera fina no cede el procesador, que es exactamente lo que
      el vigilante del núcleo 1 considera un cuelgue. Se apaga a propósito: la
