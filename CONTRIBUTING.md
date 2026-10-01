@@ -6,8 +6,9 @@
 2. Edita el sketch en su carpeta (`oryx_signal_esp32/` o `oryx_signal_sd/`).
    Cada uno es un solo archivo `.ino` a propósito.
 3. Comprueba que compile con el core **esp32 by Espressif Systems** 3.x y la
-   placa **ESP32 Dev Module**. El firmware SD usa **U8g2**, **ESP32Encoder** y
-   **Button2**.
+   placa **ESP32 Dev Module**. Los dos también tienen que compilar para
+   **ESP32S3 Dev Module** con **USB CDC On Boot: Enabled**. El firmware SD usa
+   **U8g2**, **ESP32Encoder** y **Button2**.
 4. Abre un pull request contra `main` contando qué cambia y cómo lo probaste
    (idealmente en una placa real).
 

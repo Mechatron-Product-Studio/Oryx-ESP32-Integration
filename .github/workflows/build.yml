@@ -19,6 +19,10 @@
 # Los archivos se escriben en las mismas direcciones que usa el Arduino IDE
 # (ver manifest.json), así la zona de ajustes (NVS) no se toca y el equipo
 # conserva la red WiFi guardada.
+#
+# Los dos firmware se compilan también para el ESP32-S3. El manifiesto
+# conserva la forma de siempre (el ESP32 clásico arriba) y suma las otras
+# placas en `variants`: una versión anterior de la app las ignora.
 
 name: Compilar firmware
 
@@ -39,6 +43,8 @@ concurrency:
 env:
   CORE: esp32:esp32@3.3.0
   FQBN: esp32:esp32:esp32
+  # USB CDC On Boot: la app habla por el USB nativo y por el del conversor
+  FQBN_S3: esp32:esp32:esp32s3:CDCOnBoot=cdc
   INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
 jobs:
@@ -77,6 +83,13 @@ jobs:
             cp "build/$nombre/$nombre.ino.bin"            "out/$nombre.app.bin"
             echo "$nombre=$fuente" >> fuentes.txt
           done
+          # Los dos también para el ESP32-S3
+          for nombre in oryx_signal_esp32 oryx_signal_sd; do
+            arduino-cli compile --fqbn "$FQBN_S3" --build-path "build/$nombre.s3" "sketch/$nombre"
+            cp "build/$nombre.s3/$nombre.ino.bootloader.bin" "out/$nombre.s3.bootloader.bin"
+            cp "build/$nombre.s3/$nombre.ino.partitions.bin" "out/$nombre.s3.partitions.bin"
+            cp "build/$nombre.s3/$nombre.ino.bin"            "out/$nombre.s3.app.bin"
+          done
           cp "$(find ~/.arduino15/packages/esp32/hardware/esp32 -name boot_app0.bin | head -n 1)" out/boot_app0.bin
 
       - name: Manifiesto
@@ -84,24 +97,29 @@ jobs:
           python3 - <<'PY'
           import datetime, json, os
           fuentes = dict(l.strip().split('=', 1) for l in open('fuentes.txt'))
-          def firmware(nombre):
-              return {
-                  'source': fuentes[nombre],
-                  'chip': 'ESP32',
-                  'parts': [
-                      {'file': f'{nombre}.bootloader.bin', 'address': 0x1000},
-                      {'file': f'{nombre}.partitions.bin', 'address': 0x8000},
-                      {'file': 'boot_app0.bin',            'address': 0xe000},
-                      {'file': f'{nombre}.app.bin',        'address': 0x10000},
-                  ],
-              }
+          # El bootloader va en 0x1000 en el ESP32 clásico y en 0x0 en el S3
+          def partes(base, bootloader):
+              return [
+                  {'file': f'{base}.bootloader.bin', 'address': bootloader},
+                  {'file': f'{base}.partitions.bin', 'address': 0x8000},
+                  {'file': 'boot_app0.bin',          'address': 0xe000},
+                  {'file': f'{base}.app.bin',        'address': 0x10000},
+              ]
+          def firmware(nombre, variantes=()):
+              f = {'source': fuentes[nombre], 'chip': 'ESP32', 'parts': partes(nombre, 0x1000)}
+              if variantes:
+                  f['variants'] = [
+                      {'chip': chip, 'parts': partes(f'{nombre}.{sufijo}', 0x0)}
+                      for chip, sufijo in variantes
+                  ]
+              return f
           manifest = {
               'commit': os.environ['GITHUB_SHA'],
               'date': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
               'core': os.environ['CORE'],
               'firmwares': {
-                  'esp32': firmware('oryx_signal_esp32'),
-                  'sd': firmware('oryx_signal_sd'),
+                  'esp32': firmware('oryx_signal_esp32', [('ESP32-S3', 's3')]),
+                  'sd': firmware('oryx_signal_sd', [('ESP32-S3', 's3')]),
               },
           }
           json.dump(manifest, open('out/manifest.json', 'w'), indent=2)
