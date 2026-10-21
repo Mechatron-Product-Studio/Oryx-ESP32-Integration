@@ -51,6 +51,10 @@
  *   RPM: 800              start speed (RPM) — used when there is no STEP_TIME
  * The start speed is shown in the unit you pick when the file opens (the
  * last one used is preselected and survives a power cycle).
+ *   RX_CHANNELS: 2,3      channels the file marks as RX (expected input) and
+ *   IO_CHANNELS: 4        shared lines (I2C SDA): this device does not receive,
+ *                         so their pins stay INPUTS and are never driven — an
+ *                         output there would fight whatever drives the line
  * A file opens and plays right away. Older exports may still carry a
  * "CYCLES:" line: it is skipped.
  *
@@ -429,6 +433,7 @@ float   metaVoltage    = 0.0f;   // VOLTAGE: read only, nothing uses it (yours t
 int     metaRPM        = 0;      // RPM: start speed (0 = keep the current one)
 float   metaStepTime   = 0.0f;   // STEP_TIME: per-step microseconds the file was authored with (diagnostic)
 int     metaResolution = 0;      // RESOLUTION (bits): analog files only
+uint16_t metaListenMask = 0;     // RX_CHANNELS / IO_CHANNELS: bit c = channel c+1 is not driven
 
 // RPM-based speed control (100 .. 8000 RPM)
 // tickUs (step_time) is derived from the formula:
@@ -1235,6 +1240,19 @@ bool parseMetaLine(const String &line) {
     Serial.printf("[SIG] Metadata RPM: %d\n", metaRPM);
     return true;
   }
+  if (line.startsWith("RX_CHANNELS") || line.startsWith("IO_CHANNELS")) {
+    // "2,3": 1-based channel numbers. Those pins stay inputs (see initOutputPins)
+    int from = 0;
+    while (from < (int)val.length()) {
+      int comma = val.indexOf(',', from);
+      if (comma < 0) comma = val.length();
+      const int ch = val.substring(from, comma).toInt();
+      if (ch >= 1 && ch <= 16) metaListenMask |= (uint16_t)(1u << (ch - 1));
+      from = comma + 1;
+    }
+    Serial.printf("[SIG] Metadata listening channels (not driven): 0x%04X\n", metaListenMask);
+    return true;
+  }
   if (line.startsWith("RESOLUTION")) {
     metaResolution = val.toInt();
     Serial.printf("[SIG] Metadata RESOLUTION: %d bits\n", metaResolution);
@@ -1301,7 +1319,7 @@ bool scanSignalFile(const String &path, ScanInfo *info) {
     Serial.println(F("[SIG] Cannot open file"));
     return false;
   }
-  metaVoltage = 0.0f; metaRPM = 0; metaStepTime = 0.0f; metaResolution = 0;
+  metaVoltage = 0.0f; metaRPM = 0; metaStepTime = 0.0f; metaResolution = 0; metaListenMask = 0;
   memset(info, 0, sizeof(*info));
   info->size = r.size();
   info->gridStep = 1.0f;
@@ -1405,6 +1423,7 @@ bool parseSignalFile(const String &path) {
   metaRPM        = 0;
   metaStepTime   = 0.0f;
   metaResolution = 0;
+  metaListenMask = 0;
 
   int skippedLines = 0;
   fileChannels = 0;
@@ -1777,6 +1796,7 @@ bool parseAnalogFile(const String &path) {
   metaRPM        = 0;
   metaStepTime   = 0.0f;
   metaResolution = 0;
+  metaListenMask = 0;
 
   std::vector<AnaSeg> segs;
   int skippedLines = 0;
@@ -2407,6 +2427,12 @@ void initOutputPins() {
   for (int c = 0; c < NUM_CHANNELS; c++) {
     if (isActiveDacPin(sigPins[c])) continue;   // the DAC drives this one
     gpio_reset_pin(sigPins[c]);
+    // An RX or shared channel is what the other side drives: never an output.
+    // Writes to an input pin's output register do nothing on the wire.
+    if (metaListenMask & (1u << c)) {
+      gpio_set_direction(sigPins[c], GPIO_MODE_INPUT);
+      continue;
+    }
     gpio_set_direction(sigPins[c], GPIO_MODE_OUTPUT);
     gpio_set_level(sigPins[c], 0);
   }
