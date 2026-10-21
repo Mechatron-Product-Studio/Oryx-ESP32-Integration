@@ -49,6 +49,16 @@
  * fijo, así que un paso puede durar hasta 2,5 µs (relojes de 200 kHz) y cada
  * flanco cae a una fracción de microsegundo de donde debe.
  *
+ * ── Recepción (canales RX) ─────────────────────────────────────────────────
+ * Un canal marcado RX en el editor no sale: su pin pasa a ser una entrada y
+ * el equipo anota cada flanco que llega, con su hora, mientras la señal
+ * suena. Un canal TX/RX (la SDA de I2C) queda en drenaje abierto: el equipo
+ * suelta la línea donde habla el otro lado y la escucha igual. Un canal RX
+ * analógico se mide con el ADC (GPIO 34, 35, 32 y 33; en el S3, 1, 2, 8 y 9,
+ * donde solo se mide: el S3 no tiene DAC).
+ * Al terminar cada vuelta capturada, el equipo manda flancos y muestras a la
+ * app, que es la que compara contra lo dibujado (ver CAPTURA).
+ *
  * ── Los dos núcleos ────────────────────────────────────────────────────────
  * La reproducción vive sola en el núcleo 1 y no se detiene por nada: es un
  * bucle de espera fina que no puede ceder tiempo sin perder precisión. La red
@@ -67,8 +77,8 @@
  * core de Arduino para ESP32 (2.x o 3.x para el clásico, 3.x para el S3).
  *
  * ── ESP32-S3 ───────────────────────────────────────────────────────────────
- * El S3 no tiene DAC, así que en él el equipo es solo digital: no hay salidas
- * analógicas. Los pines
+ * El S3 no tiene DAC, así que no emite señales analógicas: solo las mide
+ * (canales RX, en una señal analógica sin salidas). Los pines
  * cambian porque el S3 no tiene del 22 al 25 (ver PINES más abajo). Se compila
  * con "USB CDC On Boot" activado para que la app hable por cualquiera de los
  * dos conectores de la placa: el USB nativo y el del conversor (UART).
@@ -81,6 +91,7 @@
 #include <Preferences.h>
 #include <esp_timer.h>
 #include <esp_cpu.h>
+#include <driver/gpio.h>
 #include <soc/gpio_reg.h>
 #include <soc/soc_caps.h>
 #include <stdarg.h>
@@ -141,18 +152,33 @@ static const uint8_t CANALES_CON_PIN = sizeof(PINES) / sizeof(PINES[0]);
 static const uint8_t MAX_CANALES_D = 16;
 
 /**
- * Las salidas analógicas son los DAC del chip. El S3 no tiene: ahí el equipo
- * es solo digital y todo lo analógico queda afuera de la compilación.
+ * Las salidas analógicas son los DAC del chip. El S3 no tiene: ahí no sale
+ * nada analógico (las salidas quedan afuera de la compilación), aunque sí
+ * mide entradas analógicas (ver PINES_ADC).
  */
 #define HAY_ANALOGICAS SOC_DAC_SUPPORTED
 #if HAY_ANALOGICAS
 /** Salidas analógicas: los dos DAC del ESP32. */
 static const uint8_t PINES_DAC[] = { 25, 26 };
 static const uint8_t MAX_CANALES_A = sizeof(PINES_DAC) / sizeof(PINES_DAC[0]);
-
 #else
 static const uint8_t MAX_CANALES_A = 0;
 #endif
+
+/**
+ * Entradas analógicas para los canales RX analógicos, en orden. Son del ADC1:
+ * el ADC2 no se puede leer con el WiFi encendido. Las tienen los dos chips:
+ * el S3, sin DAC, igual mide (una señal analógica "solo para medir").
+ */
+#define HAY_ENTRADAS_A SOC_ADC_SUPPORTED
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+/** S3: ADC1 en GPIO 1, 2, 8 y 9, libres de los pines digitales y del USB. */
+static const uint8_t PINES_ADC[] = { 1, 2, 8, 9 };
+#else
+/** ESP32: el 34 y el 35 son solo entrada; el 32 y el 33, libres en las DevKit. */
+static const uint8_t PINES_ADC[] = { 34, 35, 32, 33 };
+#endif
+static const uint8_t MAX_ENTRADAS_A = sizeof(PINES_ADC) / sizeof(PINES_ADC[0]);
 
 /**
  * Velocidad del puerto serie. Tiene que coincidir con la de la app (que, si no
@@ -368,10 +394,19 @@ static inline void escribirCanalesExtra(uint8_t bits) {
   (void)bits;
 }
 
+/**
+ * Canales con pin que el equipo escucha en vez de manejar (ver CAPTURA).
+ * `mascaraEntrada`: RX, el pin es una entrada y no se escribe nunca.
+ * `mascaraCompartida`: TX/RX, drenaje abierto: un 1 suelta la línea (la
+ * levanta la resistencia del bus) y un 0 la baja; el pin se lee igual.
+ */
+static volatile uint8_t mascaraEntrada    = 0;
+static volatile uint8_t mascaraCompartida = 0;
+
 /** Pone los canales cargados como dice la máscara, todos juntos. */
 static inline void escribirMask(uint16_t m) {
   const uint16_t cargados = (uint16_t)((1UL << nCanales) - 1);
-  const uint8_t  conPin   = (uint8_t)(cargados & 0xFF);
+  const uint8_t  conPin   = (uint8_t)(cargados & 0xFF & ~mascaraEntrada);
   REG_WRITE(GPIO_OUT_W1TS_REG, gpioDe[m & conPin]);
   REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[~m & conPin]);
   if (nCanales > CANALES_CON_PIN) {
@@ -397,8 +432,10 @@ static inline uint8_t aDac(uint16_t nivel) {
 /** Todo abajo: es donde queda la señal cuando está parada. */
 static void salidasIdle() {
   // Se barren TODOS los pines, no solo los canales cargados: puede quedar uno
-  // en alto de una señal anterior con más canales que la de ahora.
-  REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[0xFF]);
+  // en alto de una señal anterior con más canales que la de ahora. Una línea
+  // compartida queda suelta (en 1): bajarla dejaría el bus tomado.
+  REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[(uint8_t)(0xFF & ~mascaraCompartida)]);
+  REG_WRITE(GPIO_OUT_W1TS_REG, gpioDe[mascaraCompartida]);
   canalesExtra = 0;
   escribirCanalesExtra(0);
 #if HAY_ANALOGICAS
@@ -439,6 +476,247 @@ static void prepararFilas() {
   // la primera fila de la vuelta siguiente.
   const double d = pasosTotalesD - posUltimaD + posPrimeraD;
   durFila[nFilas - 1] = d > 0 ? (float)d : 0.0f;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAPTURA — canales RX
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Lo que el editor marca RX es lo que se espera recibir. El equipo no lo
+// interpreta: anota cada flanco de esos pines con su hora y se los manda a la
+// app, que lo compara con lo dibujado (lib/reception.ts). Así el firmware no
+// sabe de UART, SPI ni I2C y sirve igual para cualquier señal digital.
+//
+//   · Cada flanco lo atiende una interrupción en el núcleo 0 (el de la red):
+//     la reproducción del núcleo 1 no se entera. La hora es la de esp_timer
+//     (µs, la misma en los dos núcleos).
+//   · La reproducción deja una marca al empezar cada vuelta, con el nivel de
+//     las entradas en ese instante: de ahí sale la posición de cada flanco
+//     dentro de la vuelta, en pasos.
+//   · Todo va a un búfer circular; la tarea de la red lo vacía y manda una
+//     vuelta por vez (CAPB … CAPE … CAPZ). Si el búfer se llena, la captura
+//     se corta y se avisa: nunca se manda una vuelta con flancos de menos
+//     como si estuviera entera.
+//   · Sin fin (lo que pide la app): se escucha mientras suena, como se
+//     transmite. Cada tanda es una vuelta; al terminar de mandarla, la red
+//     pide la próxima y se captura la vuelta que empiece después. Si la red
+//     no da abasto, se saltean vueltas, nunca se cortan; un búfer lleno
+//     descarta esa vuelta (CAPEND 2) y se sigue con la siguiente.
+//
+// Precisión: la del reloj (1 µs) más lo que tarda en entrar la interrupción
+// (unos µs, más si el WiFi está ocupado). Para leer bits hace falta que un
+// paso dure bastante más que eso: la app avisa por debajo de 10 µs.
+
+/** Un flanco capturado, o una marca de vuelta/fin (ver CAP_MARCA_*). */
+struct EventoCaptura {
+  uint32_t t;        // esp_timer, µs (los 32 bits bajos)
+  uint8_t  canal;    // canal con pin, o una marca
+  uint8_t  nivel;    // nivel después del flanco; en una marca de vuelta, las entradas
+  uint16_t vuelta;   // vuelta capturada, desde 0
+};
+static const uint8_t CAP_MARCA_VUELTA = 0xFF;
+static const uint8_t CAP_MARCA_FIN    = 0xFE;
+/** Cómo terminó la captura (en el `nivel` de la marca de fin). */
+static const uint8_t CAP_FIN_ENTERA   = 0;
+static const uint8_t CAP_FIN_CORTADA  = 1;   // la señal se detuvo o reinició a mitad de vuelta
+static const uint8_t CAP_FIN_LLENA    = 2;   // el búfer se llenó: llegaron más flancos de los que entran
+
+static EventoCaptura*    anilloCap   = nullptr;
+static uint32_t          tamCap      = 0;    // potencia de dos
+static volatile uint32_t cabezaCap   = 0;
+static volatile uint32_t colaCap     = 0;
+static volatile uint32_t perdidosCap = 0;
+static portMUX_TYPE      candadoCap  = portMUX_INITIALIZER_UNLOCKED;
+
+/** Vueltas que pidió la app por cada arranque (0 = sin captura). */
+static uint16_t          vueltasCap  = 0;
+/** `vueltas` de CAP que pide escuchar sin fin, mientras la señal suene. */
+static const uint32_t    CAP_SIN_FIN = 65535;
+/** Sin fin: cada tanda es una vuelta y, al mandarla, se pide la próxima. */
+static volatile bool     capContinua = false;
+/** Empezar a capturar en la próxima vuelta. */
+static volatile bool     capPedida   = false;
+static volatile bool     capActiva   = false;
+static volatile uint16_t capVuelta   = 0;
+static volatile uint16_t capFaltan   = 0;
+static bool              isrInstalado = false;
+
+/**
+ * Una muestra analógica va en el mismo búfer que los flancos, con el canal
+ * marcado con este bit y los milivoltios en `vuelta` (ver atenderCaptura).
+ */
+static const uint8_t CAP_ANALOGICA = 0x80;
+/**
+ * Lo más seguido que se muestrea: leer una entrada calibrada lleva decenas de
+ * µs y la tarea comparte el núcleo con la red. Con varias entradas, cada una
+ * se lee en su turno y la tanda tarda más.
+ */
+static const uint32_t PERIODO_MIN_ADC_US = 200;
+/** Entradas analógicas que se capturan (las primeras de PINES_ADC). */
+static volatile uint8_t entradasA = 0;
+/** Muestras por vuelta y por entrada que pidió la app (el período sale de acá). */
+static uint32_t muestrasPorVuelta = 1000;
+static esp_timer_handle_t relojAdc = nullptr;
+static TaskHandle_t tareaAdcHandle = nullptr;
+static bool adcEnMarcha = false;
+
+/** El pin de cada canal, en RAM: la interrupción no espera a la flash. */
+static DRAM_ATTR uint8_t pinCap[8];
+
+/**
+ * Mete un evento; si no hay lugar, lo cuenta como perdido. Recibe los campos
+ * sueltos y no el struct: el IDE declara las funciones arriba de todo, antes
+ * de que exista el tipo (ver TIPOS DEL WEBSOCKET).
+ */
+static inline void IRAM_ATTR empujarCap(uint32_t t, uint8_t canal, uint8_t nivel, uint16_t vuelta) {
+  if (!anilloCap) return;
+  if (cabezaCap - colaCap >= tamCap) { perdidosCap = perdidosCap + 1; return; }
+  EventoCaptura& e = anilloCap[cabezaCap & (tamCap - 1)];
+  e.t = t;
+  e.canal = canal;
+  e.nivel = nivel;
+  e.vuelta = vuelta;
+  cabezaCap = cabezaCap + 1;
+}
+
+static void IRAM_ATTR isrCaptura(void* arg) {
+  if (!capActiva) return;
+  const uint8_t canal = (uint8_t)(uintptr_t)arg;
+  const uint32_t t = (uint32_t)esp_timer_get_time();
+  const uint8_t nivel = (uint8_t)((REG_READ(GPIO_IN_REG) >> pinCap[canal]) & 1);
+  portENTER_CRITICAL_ISR(&candadoCap);
+  empujarCap(t, canal, nivel, capVuelta);
+  portEXIT_CRITICAL_ISR(&candadoCap);
+}
+
+/** Nivel de los pines que se escuchan, bit i = canal i. */
+static inline uint8_t nivelesEscucha() {
+  const uint32_t in = REG_READ(GPIO_IN_REG);
+  const uint8_t escucha = mascaraEntrada | mascaraCompartida;
+  uint8_t m = 0;
+  for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
+    if ((escucha & (1u << i)) && ((in >> pinCap[i]) & 1)) m |= (uint8_t)(1u << i);
+  }
+  return m;
+}
+
+static void marcaCap(uint8_t canal, uint8_t nivel, uint16_t vuelta) {
+  const uint32_t t = (uint32_t)esp_timer_get_time();
+  portENTER_CRITICAL(&candadoCap);
+  empujarCap(t, canal, nivel, vuelta);
+  portEXIT_CRITICAL(&candadoCap);
+}
+
+/**
+ * La reproducción la llama al empezar cada vuelta, justo antes de escribir la
+ * primera fila. Arranca la captura pedida, o cierra la vuelta que se estaba
+ * capturando y abre la siguiente (o termina).
+ */
+static inline void vueltaCaptura() {
+  if (capPedida) {
+    capPedida = false;
+    // Sin fin, cada tanda lleva su número: la app no confunde una con otra
+    capVuelta = capContinua ? (uint16_t)(capVuelta + 1) : 0;
+    capFaltan = vueltasCap;
+    marcaCap(CAP_MARCA_VUELTA, nivelesEscucha(), 0);
+    capActiva = true;
+    // Las analógicas arrancan ya, con la primera muestra en el comienzo
+    if (entradasA > 0 && tareaAdcHandle) xTaskNotifyGive(tareaAdcHandle);
+    return;
+  }
+  if (!capActiva) return;
+  if (capFaltan > 0) capFaltan = capFaltan - 1;
+  if (capFaltan == 0) {
+    capActiva = false;
+    marcaCap(CAP_MARCA_FIN, CAP_FIN_ENTERA, capVuelta);
+    return;
+  }
+  capVuelta = capVuelta + 1;
+  marcaCap(CAP_MARCA_VUELTA, nivelesEscucha(), capVuelta);
+}
+
+/** Corta la captura en curso (la señal se detuvo, se reinició o se recargó). */
+static void cortarCaptura(uint8_t motivo) {
+  if (!capActiva) return;
+  capActiva = false;
+  marcaCap(CAP_MARCA_FIN, motivo, capVuelta);
+}
+
+/** Cuántos eventos entrarían en el búfer de captura con la memoria de ahora. */
+static uint32_t capacidadCaptura() {
+  if (anilloCap) return tamCap;
+  uint32_t libre = ESP.getFreeHeap();
+  libre = libre > 48 * 1024 ? libre - 48 * 1024 : 0;
+  const uint32_t bloque = ESP.getMaxAllocHeap();
+  if (bloque < libre) libre = bloque;
+  uint32_t cap = 8192;
+  while (cap >= 256 && cap * sizeof(EventoCaptura) > libre) cap >>= 1;
+  return cap >= 256 ? cap : 0;
+}
+
+/** Vuelve a salidas (en bajo) los pines de los canales de `soltar`. */
+static void pinesASalida(uint8_t soltar) {
+  for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
+    if (!(soltar & (1u << i))) continue;
+    if (isrInstalado) gpio_isr_handler_remove((gpio_num_t)PINES[i]);
+    gpio_set_intr_type((gpio_num_t)PINES[i], GPIO_INTR_DISABLE);
+    pinMode(PINES[i], OUTPUT);
+    digitalWrite(PINES[i], LOW);
+  }
+}
+
+/** Ningún canal se escucha: todos los pines vuelven a ser salidas. */
+static void soltarCaptura() {
+  cortarCaptura(CAP_FIN_CORTADA);
+  capPedida = false;
+  capContinua = false;
+  vueltasCap = 0;
+  entradasA = 0;
+  const uint8_t antes = mascaraEntrada | mascaraCompartida;
+  mascaraEntrada = 0;
+  mascaraCompartida = 0;
+  pinesASalida(antes);
+}
+
+/** El temporizador solo despierta a la tarea: leer el ADC no va en su callback. */
+static void alRelojAdc(void*) {
+  if (tareaAdcHandle) xTaskNotifyGive(tareaAdcHandle);
+}
+
+/**
+ * Muestrea las entradas analógicas mientras dura la captura (núcleo 0). El
+ * período sale de lo que dura la vuelta y de las muestras pedidas, con un
+ * piso de PERIODO_MIN_ADC_US. Cada muestra lleva su hora, como un flanco:
+ * si el núcleo se atrasa, la muestra cae donde cayó y no donde debía.
+ */
+static void tareaAdc(void*) {
+  for (;;) {
+    const uint32_t avisos = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+#if HAY_ENTRADAS_A
+    const bool hay = capActiva && entradasA > 0 && relojAdc != nullptr;
+    if (!hay) {
+      if (adcEnMarcha) { esp_timer_stop(relojAdc); adcEnMarcha = false; }
+      continue;
+    }
+    if (!adcEnMarcha) {
+      double periodo = (double)usPaso * (double)pasosTotales / (double)(muestrasPorVuelta ? muestrasPorVuelta : 1);
+      if (periodo < PERIODO_MIN_ADC_US) periodo = PERIODO_MIN_ADC_US;
+      esp_timer_start_periodic(relojAdc, (uint64_t)periodo);
+      adcEnMarcha = true;
+    }
+    if (avisos == 0) continue;            // se despertó por el plazo, no por el reloj
+    const uint8_t n = entradasA;
+    for (uint8_t i = 0; i < n; i++) {
+      const uint32_t mv = analogReadMilliVolts(PINES_ADC[i]);
+      const uint32_t t = (uint32_t)esp_timer_get_time();
+      portENTER_CRITICAL(&candadoCap);
+      empujarCap(t, (uint8_t)(CAP_ANALOGICA | i), 0, (uint16_t)(mv > 65535 ? 65535 : mv));
+      portEXIT_CRITICAL(&candadoCap);
+    }
+#else
+    (void)avisos;                         // un chip sin ADC no mide
+#endif
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -498,6 +776,7 @@ static void reproducirDigital() {
   uint16_t i = 0;
 
   while (corriendo) {
+    if (i == 0) vueltaCaptura();
     escribirMask(filas[i].mask);
     posActual = (float)filas[i].pos;
 
@@ -540,6 +819,7 @@ static void reproducirFlujo() {
     __sync_synchronize();
     cola = cola + 1;
 
+    if (enVuelta == 0) vueltaCaptura();
     escribirMask(e.mask);
     posActual = (float)posVuelta;
     posVuelta += e.dur;
@@ -563,6 +843,7 @@ static void reproducirAnalogico() {
   int64_t  antes  = esp_timer_get_time();
   double   m      = 0;                    // posición, en muestras
   uint32_t ultima = UINT32_MAX;
+  vueltaCaptura();                        // empieza una vuelta
 
   while (corriendo) {
     if (pedidoReinicio) return;
@@ -573,7 +854,9 @@ static void reproducirAnalogico() {
     const int64_t ahora = esp_timer_get_time();
     m += (double)(ahora - antes) / usMuestra;
     antes = ahora;
-    while (m >= (double)nMuestras) { m -= (double)nMuestras; vueltas = vueltas + 1; }
+    bool nuevaVuelta = false;
+    while (m >= (double)nMuestras) { m -= (double)nMuestras; vueltas = vueltas + 1; nuevaVuelta = true; }
+    if (nuevaVuelta) vueltaCaptura();
 
     const uint32_t i = (uint32_t)m;
     if (i != ultima) {
@@ -982,13 +1265,13 @@ static const char ESTILO[] = R"CSS(<style>
  --primario:#030213;--primario-texto:#ffffff;--enlace:#2563eb;
  --tonal:rgba(59,130,246,.10);--tonal-hover:rgba(59,130,246,.18);--tonal-borde:rgba(59,130,246,.40);--tonal-texto:#1d4ed8;
  --ok:#28a745;--error:#ef4444;--error-fondo:rgba(239,68,68,.08);--error-borde:rgba(239,68,68,.40);
- --cabecera:#17181b;--foco:rgba(59,130,246,.30)}
+ --cabecera:#0b0c0e;--foco:rgba(59,130,246,.30)}
 @media (prefers-color-scheme:dark){:root{
- --fondo:#17181b;--tarjeta:#26282b;--borde:#3e4043;--caja:#1f2123;--campo:#1f2123;
+ --fondo:#0b0c0e;--tarjeta:#17181b;--borde:#2a2c31;--caja:#111214;--campo:#111214;
  --titulo:#ffffff;--texto:#a1a2a5;--rotulo:#717275;
  --primario:#fafafa;--primario-texto:#171717;--enlace:#60a5fa;
  --tonal:rgba(96,165,250,.12);--tonal-hover:rgba(96,165,250,.20);--tonal-borde:rgba(96,165,250,.40);--tonal-texto:#93c5fd;
- --error-fondo:rgba(239,68,68,.12);--cabecera:#111214}}
+ --error-fondo:rgba(239,68,68,.12);--cabecera:#060708}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:40px 16px;
@@ -1427,14 +1710,24 @@ static void mandarSaludo() {
     snprintf(pa + n, sizeof(pa) - n, i ? ",%u" : "%u", (unsigned)PINES_DAC[i]);
   }
 #endif
-  // El chip, los pines y el búfer de streaming van al final: una app anterior
-  // lee solo los primeros campos y no se entera.
-  decirf("READY %u %s %u %u %u %u %u %s %s %s %u",
+  // El chip, los pines, el búfer de streaming y el de captura van al final:
+  // una app anterior lee solo los primeros campos y no se entera.
+  // Entradas analógicas de captura y el período mínimo de muestreo
+  char pe[24] = "-";
+#if HAY_ENTRADAS_A
+  pe[0] = '\0';
+  for (uint8_t i = 0; i < MAX_ENTRADAS_A; i++) {
+    const size_t n = strlen(pe);
+    snprintf(pe + n, sizeof(pe) - n, i ? ",%u" : "%u", (unsigned)PINES_ADC[i]);
+  }
+#endif
+  decirf("READY %u %s %u %u %u %u %u %s %s %s %u %u %s %u",
          (uint32_t)PROTO, nombreEquipo,
          (uint32_t)MAX_CANALES_D, (uint32_t)MAX_CANALES_A,
          (uint32_t)MAX_FILAS, (uint32_t)MAX_MUESTRAS,
          V_MAX_MV, CHIP, pd, pa,
-         anillo ? capAnillo : capacidadAnillo());
+         anillo ? capAnillo : capacidadAnillo(),
+         capacidadCaptura(), pe, PERIODO_MIN_ADC_US);
 }
 
 // ── Streaming ──────────────────────────────────────────────────────────────
@@ -1501,6 +1794,9 @@ static void cmdSBegin(char* args) {
   if (!sCan || !sPas || !sEv) { decir("ERR SBEGIN incompleto"); return; }
 
   detenerYEsperar();
+  cortarCaptura(CAP_FIN_CORTADA);
+  capPedida = false;
+  capContinua = false;                   // hasta el CAP de esta carga
   liberarAnillo();
   uint8_t canales = (uint8_t)atoi(sCan);
   if (canales == 0) { decir("ERR sin canales"); return; }
@@ -1563,13 +1859,22 @@ static void cmdBegin(char* args) {
 
   const uint8_t nuevoModo = (tipo[0] == 'A') ? MODO_ANALOGICO : MODO_DIGITAL;
   const uint8_t tope = nuevoModo == MODO_ANALOGICO ? MAX_CANALES_A : MAX_CANALES_D;
-  // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí
-  if (tope == 0) { decir("ERR este equipo no tiene salidas analógicas"); return; }
+  // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí.
+  // Sin DAC (S3), una analógica sin salidas igual entra: es para medir
+  const bool soloMedir = nuevoModo == MODO_ANALOGICO && atoi(sCan) == 0 && MAX_ENTRADAS_A > 0;
+  if (tope == 0 && !soloMedir) { decir("ERR este equipo no tiene salidas analógicas"); return; }
 
   detenerYEsperar();
+  // Los pines que escuchan siguen siendo entradas: volverlos salidas aunque
+  // fuera un momento chocaría con lo que maneja el otro lado. La app manda
+  // CAP después de cada carga (CAP 0 0 0 los vuelve salidas).
+  cortarCaptura(CAP_FIN_CORTADA);
+  capPedida = false;
+  capContinua = false;                   // hasta el CAP de esta carga
   liberarAnillo();                       // una señal que entra en memoria deja el streaming
   uint8_t canales = (uint8_t)atoi(sCan);
-  if (canales == 0) { decir("ERR sin canales"); return; }
+  // Una analógica sin salidas sirve para medir: solo da el largo de la vuelta
+  if (canales == 0 && (nuevoModo == MODO_DIGITAL || MAX_ENTRADAS_A == 0)) { decir("ERR sin canales"); return; }
   if (canales > tope) canales = tope;
 
   modo         = nuevoModo;
@@ -1649,6 +1954,8 @@ static void cmdEnd(char* args) {
     return;
   }
   if (pasosTotales <= 0) { decir("ERR la señal no tiene largo"); return; }
+  // Sin salidas (solo se mide): una muestra por vuelta marca el ritmo
+  if (modo == MODO_ANALOGICO && nCanales == 0) nMuestras = 1;
 
   if (modo == MODO_DIGITAL) prepararFilas();
   recalcularFactor();
@@ -1692,6 +1999,190 @@ static void cmdSet(char* args) {
   mandarEstado();
 }
 
+/**
+ * Qué canales se escuchan: CAP <rx> <compartidos> <vueltas> [<analógicas> <muestras>]
+ *
+ * `analógicas` es cuántas entradas de PINES_ADC se miden (en modo
+ * analógico) y `muestras`, cuántas por vuelta y por entrada.
+ *
+ * `rx` y `compartidos` son máscaras de canales (bit i = canal i); solo
+ * cuentan los que tienen pin. Con todo en 0 los pines vuelven a ser salidas.
+ * Se manda después de cargar la señal (la carga no toca los pines); cada RUN
+ * captura esas vueltas desde el principio de una vuelta, y CAPGO pide otra
+ * tanda sin parar la señal. Con `vueltas` en CAP_SIN_FIN se escucha mientras
+ * suene: una vuelta por tanda, rearmada al terminar de mandarla.
+ */
+static void cmdCap(char* args) {
+  char* resto = nullptr;
+  const char* sRx = strtok_r(args, " ", &resto);
+  const char* sIo = strtok_r(nullptr, " ", &resto);
+  const char* sV  = strtok_r(nullptr, " ", &resto);
+  if (!sRx || !sIo || !sV) { decir("ERR CAP incompleto"); return; }
+  const uint8_t conPin = (uint8_t)((1UL << CANALES_CON_PIN) - 1);
+  const uint8_t rx = (uint8_t)strtoul(sRx, nullptr, 10) & conPin;
+  const uint8_t io = (uint8_t)strtoul(sIo, nullptr, 10) & conPin & ~rx;
+  const uint32_t v = strtoul(sV, nullptr, 10);
+  const char* sA = strtok_r(nullptr, " ", &resto);
+  const char* sN = strtok_r(nullptr, " ", &resto);
+  uint32_t ea = sA ? strtoul(sA, nullptr, 10) : 0;
+  if (ea > MAX_ENTRADAS_A) ea = MAX_ENTRADAS_A;
+  uint32_t nm = sN ? strtoul(sN, nullptr, 10) : 1000;
+  if (nm < 16) nm = 16;
+  if (nm > 4000) nm = 4000;
+
+  cortarCaptura(CAP_FIN_CORTADA);
+  capPedida = false;
+  if (v == 0 || ((rx | io) == 0 && ea == 0)) { soltarCaptura(); decir("CAPREADY 0"); return; }
+
+  if (!anilloCap) {
+    const uint32_t cap = capacidadCaptura();
+    anilloCap = cap ? (EventoCaptura*)malloc(cap * sizeof(EventoCaptura)) : nullptr;
+    if (!anilloCap) { soltarCaptura(); decir("ERR no hay memoria para capturar"); return; }
+    tamCap = cap;
+  }
+  cabezaCap = 0;
+  colaCap = 0;
+  perdidosCap = 0;
+  if (!isrInstalado && (rx | io) != 0) {
+    const esp_err_t err = gpio_install_isr_service(0);
+    isrInstalado = (err == ESP_OK || err == ESP_ERR_INVALID_STATE);
+    if (!isrInstalado) { soltarCaptura(); decir("ERR no se pudieron activar las interrupciones"); return; }
+  }
+
+  // Los que dejan de escuchar vuelven a ser salidas; los que siguen igual no
+  // se tocan, y los nuevos pasan directo a entrada (o drenaje abierto) sin
+  // pasar por salida: nunca se maneja una línea que es del otro lado.
+  const uint8_t rxAntes = mascaraEntrada, ioAntes = mascaraCompartida;
+  mascaraEntrada = rx;
+  mascaraCompartida = io;
+  pinesASalida((uint8_t)((rxAntes | ioAntes) & ~(rx | io)));
+  for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
+    const uint8_t bit = (uint8_t)(1u << i);
+    if (!((rx | io) & bit)) continue;
+    if ((rxAntes & bit) == (rx & bit) && (ioAntes & bit) == (io & bit)) continue;
+    const gpio_num_t pin = (gpio_num_t)PINES[i];
+    if (io & bit) gpio_set_level(pin, 1);   // suelto antes de pasar a drenaje abierto
+    gpio_config_t c = {};
+    c.pin_bit_mask = 1ULL << PINES[i];
+    c.mode = (io & bit) ? GPIO_MODE_INPUT_OUTPUT_OD : GPIO_MODE_INPUT;
+    c.pull_up_en = GPIO_PULLUP_DISABLE;     // la resistencia es del circuito, no del equipo
+    c.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    c.intr_type = GPIO_INTR_ANYEDGE;
+    gpio_config(&c);
+    if (io & bit) gpio_set_level(pin, 1);   // suelta la línea hasta que suene
+    gpio_isr_handler_add(pin, isrCaptura, (void*)(uintptr_t)i);
+  }
+#if HAY_ENTRADAS_A
+  for (uint8_t i = 0; i < ea; i++) {
+    pinMode(PINES_ADC[i], INPUT);
+    analogSetPinAttenuation(PINES_ADC[i], ADC_11db);   // hasta ~3,1 V
+  }
+#endif
+  entradasA = (uint8_t)ea;
+  muestrasPorVuelta = nm;
+  capContinua = v >= CAP_SIN_FIN;
+  vueltasCap = capContinua ? 1 : (uint16_t)(v > 1000 ? 1000 : v);
+  capPedida = true;
+  decirf("CAPREADY %u", tamCap);
+}
+
+/**
+ * Lo que se capturó, a la app. Corre en la tarea de la red: vacía el búfer y
+ * manda cada vuelta como
+ *
+ *   CAPB <vuelta> <µs por paso> <paso de la primera fila> <entradas al empezar>
+ *   CAPE <base64>   flancos de 6 bytes: float32 paso, uint8 canal, uint8 nivel
+ *   CAPZ <vuelta>
+ *
+ * y al final CAPEND <cómo terminó> <perdidos>. Las posiciones salen del
+ * tiempo de paso vigente al mandarlas: cambiar la velocidad a mitad de una
+ * vuelta capturada la deja corrida.
+ */
+static bool     capVueltaAbierta = false;
+static uint16_t capVueltaEnvio   = 0;
+static uint32_t capT0            = 0;
+static uint8_t  capLote[6 * 96];
+static uint8_t  capLoteN         = 0;
+/** Muestras analógicas de 8 bytes: float32 paso, uint8 entrada, relleno, uint16 mV. */
+static uint8_t  capLoteA[8 * 72];
+static uint8_t  capLoteAN        = 0;
+
+static void mandarLoteA() {
+  if (capLoteAN == 0) return;
+  char b64[4 * ((sizeof(capLoteA) + 2) / 3) + 8];
+  memcpy(b64, "CAPA ", 5);
+  base64Encode(capLoteA, (size_t)capLoteAN * 8, b64 + 5);
+  decir(b64);
+  capLoteAN = 0;
+}
+
+static void mandarLoteCap() {
+  if (capLoteN == 0) return;
+  char b64[4 * ((sizeof(capLote) + 2) / 3) + 8];
+  memcpy(b64, "CAPE ", 5);
+  base64Encode(capLote, (size_t)capLoteN * 6, b64 + 5);
+  decir(b64);
+  capLoteN = 0;
+}
+
+static void atenderCaptura() {
+  // Más flancos de los que entran: la captura ya no dice la verdad
+  if (capActiva && perdidosCap > 0) cortarCaptura(CAP_FIN_LLENA);
+  uint16_t tanda = 0;
+  while (colaCap != cabezaCap && tanda++ < 512) {
+    EventoCaptura e;
+    portENTER_CRITICAL(&candadoCap);
+    e = anilloCap[colaCap & (tamCap - 1)];
+    colaCap = colaCap + 1;
+    portEXIT_CRITICAL(&candadoCap);
+
+    if (e.canal == CAP_MARCA_VUELTA) {
+      mandarLoteCap();
+      mandarLoteA();
+      if (capVueltaAbierta) decirf("CAPZ %u", (uint32_t)capVueltaEnvio);
+      capVueltaAbierta = true;
+      capVueltaEnvio = e.vuelta;
+      capT0 = e.t;
+      decirf("CAPB %u %.4f %.6f %u", (uint32_t)e.vuelta, (double)usPaso,
+             (modo == MODO_DIGITAL && !flujo) ? posPrimeraD : 0.0, (uint32_t)e.nivel);
+      continue;
+    }
+    if (e.canal == CAP_MARCA_FIN) {
+      mandarLoteCap();
+      mandarLoteA();
+      if (capVueltaAbierta) decirf("CAPZ %u", (uint32_t)capVueltaEnvio);
+      capVueltaAbierta = false;
+      decirf("CAPEND %u %u", (uint32_t)e.nivel, (uint32_t)perdidosCap);
+      perdidosCap = 0;
+      // Sin fin: la tanda ya salió entera (o se descartó por llena), así que
+      // se escucha la próxima vuelta. Una cortada es un HALT, RESET o carga:
+      // el que cortó decide si se vuelve a escuchar.
+      if (capContinua && vueltasCap > 0 && e.nivel != CAP_FIN_CORTADA && !capActiva) capPedida = true;
+      continue;
+    }
+    if (!capVueltaAbierta) continue;
+    const float us = usPaso > 0 ? usPaso : 1.0f;
+    const float base = (modo == MODO_DIGITAL && !flujo) ? (float)posPrimeraD : 0.0f;
+    const float pos = base + (float)(int32_t)(e.t - capT0) / us;
+    if (e.canal & CAP_ANALOGICA) {
+      uint8_t* a = capLoteA + (size_t)capLoteAN * 8;
+      memcpy(a, &pos, 4);
+      a[4] = (uint8_t)(e.canal & 0x7F);
+      a[5] = 0;
+      a[6] = (uint8_t)(e.vuelta & 0xFF);
+      a[7] = (uint8_t)(e.vuelta >> 8);
+      if (++capLoteAN >= sizeof(capLoteA) / 8) mandarLoteA();
+      continue;
+    }
+    uint8_t* d = capLote + (size_t)capLoteN * 6;
+    memcpy(d, &pos, 4);
+    d[4] = e.canal;
+    d[5] = e.nivel;
+    if (++capLoteN >= sizeof(capLote) / 6) mandarLoteCap();
+  }
+  if (colaCap == cabezaCap) { mandarLoteCap(); mandarLoteA(); }
+}
+
 static void procesarLinea(char* linea) {
   while (*linea == ' ') linea++;
   if (*linea == '\0' || *linea == '\r') return;
@@ -1711,20 +2202,32 @@ static void procesarLinea(char* linea) {
   else if (!strcmp(linea, "BEGIN")) cmdBegin(args);
   else if (!strcmp(linea, "END"))   cmdEnd(args);
   else if (!strcmp(linea, "SET"))   cmdSet(args);
+  else if (!strcmp(linea, "CAP"))   cmdCap(args);
+  else if (!strcmp(linea, "CAPGO")) {
+    if (vueltasCap == 0) { decir("ERR no hay canales RX configurados"); return; }
+    cortarCaptura(CAP_FIN_CORTADA);
+    capPedida = true;
+  }
   else if (!strcmp(linea, "HELLO")) { mandarSaludo(); mandarEstado(); }
   else if (!strcmp(linea, "PING"))  decirf("PONG %s", args ? args : "0");
   else if (!strcmp(linea, "RUN")) {
     if (cargando)          { decir("ERR la señal todavía se está cargando"); return; }
     if (modo == MODO_NADA) { decir("ERR todavía no hay señal cargada"); return; }
+    // Cada arranque es una prueba nueva: se captura desde la primera vuelta
+    if (!corriendo && vueltasCap > 0) { cortarCaptura(CAP_FIN_CORTADA); capPedida = true; }
     corriendo = true;
     mandarEstado();
   }
   else if (!strcmp(linea, "HALT")) {
     detenerYEsperar();
+    cortarCaptura(CAP_FIN_CORTADA);
+    capPedida = false;
     salidasIdle();
     mandarEstado();
   }
   else if (!strcmp(linea, "RESET")) {
+    // La vuelta a medias no se compara: se vuelve a capturar desde el principio
+    if (capActiva) { cortarCaptura(CAP_FIN_CORTADA); capPedida = vueltasCap > 0; }
     pedidoReinicio = true;
     vueltas = 0;
     posActual = 0;
@@ -2471,6 +2974,8 @@ static void tareaRed(void*) {
       ultimoEstado = millis();
       mandarEstado();
     }
+    // Lo capturado de los canales RX, a la app
+    if (anilloCap && (wsAbierto || enlaceSerie)) atenderCaptura();
     // Créditos del streaming: cuánto lugar hay y cuánto llegó
     if (flujo && anillo && (wsAbierto || enlaceSerie) && millis() - ultimoLibre >= 25) {
       ultimoLibre = millis();
@@ -2517,6 +3022,7 @@ void setup() {
   for (uint8_t i = 0; i < CANALES_CON_PIN; i++) {
     pinMode(PINES[i], OUTPUT);
     digitalWrite(PINES[i], LOW);
+    pinCap[i] = PINES[i];
   }
   recalcularFactor();
 
@@ -2579,6 +3085,17 @@ void setup() {
   xTaskCreatePinnedToCore(tareaRed,          "red",  8192, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(tareaVecinos,  "vecinos",  4096, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(tareaReproduccion, "play", 4096, nullptr, 5, nullptr, 1);
+#if HAY_ENTRADAS_A
+  // Muestreo de las entradas analógicas de captura (núcleo 0, con la red)
+  xTaskCreatePinnedToCore(tareaAdc, "adc", 3072, nullptr, 2, &tareaAdcHandle, 0);
+  esp_timer_create_args_t argsAdc = {};
+  argsAdc.callback = alRelojAdc;
+  argsAdc.name = "adc";
+  esp_timer_create(&argsAdc, &relojAdc);
+#else
+  (void)tareaAdc;                        // un chip sin ADC no mide
+  (void)alRelojAdc;
+#endif
 }
 
 void loop() {
