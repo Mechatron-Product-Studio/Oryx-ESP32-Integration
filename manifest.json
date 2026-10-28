@@ -1,0 +1,97 @@
+{
+  "commit": "950017135cac7a802c6eba1d7e7d043c0800108a",
+  "date": "2026-10-28T16:03:45+00:00",
+  "core": "esp32:esp32@3.3.0",
+  "firmwares": {
+    "esp32": {
+      "source": "oryx_signal_esp32/oryx_signal_esp32.ino",
+      "chip": "ESP32",
+      "parts": [
+        {
+          "file": "oryx_signal_esp32.bootloader.bin",
+          "address": 4096
+        },
+        {
+          "file": "oryx_signal_esp32.partitions.bin",
+          "address": 32768
+        },
+        {
+          "file": "boot_app0.bin",
+          "address": 57344
+        },
+        {
+          "file": "oryx_signal_esp32.app.bin",
+          "address": 65536
+        }
+      ],
+      "variants": [
+        {
+          "chip": "ESP32-S3",
+          "parts": [
+            {
+              "file": "oryx_signal_esp32.s3.bootloader.bin",
+              "address": 0
+            },
+            {
+              "file": "oryx_signal_esp32.s3.partitions.bin",
+              "address": 32768
+            },
+            {
+              "file": "boot_app0.bin",
+              "address": 57344
+            },
+            {
+              "file": "oryx_signal_esp32.s3.app.bin",
+              "address": 65536
+            }
+          ]
+        }
+      ]
+    },
+    "sd": {
+      "source": "oryx_signal_sd/oryx_signal_sd.ino",
+      "chip": "ESP32",
+      "parts": [
+        {
+          "file": "oryx_signal_sd.bootloader.bin",
+          "address": 4096
+        },
+        {
+          "file": "oryx_signal_sd.partitions.bin",
+          "address": 32768
+        },
+        {
+          "file": "boot_app0.bin",
+          "address": 57344
+        },
+        {
+          "file": "oryx_signal_sd.app.bin",
+          "address": 65536
+        }
+      ],
+      "variants": [
+        {
+          "chip": "ESP32-S3",
+          "parts": [
+            {
+              "file": "oryx_signal_sd.s3.bootloader.bin",
+              "address": 0
+            },
+            {
+              "file": "oryx_signal_sd.s3.partitions.bin",
+              "address": 32768
+            },
+            {
+              "file": "boot_app0.bin",
+              "address": 57344
+            },
+            {
+              "file": "oryx_signal_sd.s3.app.bin",
+              "address": 65536
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
