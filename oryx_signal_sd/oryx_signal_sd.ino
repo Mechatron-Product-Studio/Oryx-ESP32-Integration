@@ -12,7 +12,12 @@
  *   analog   → one row per chord segment (from, to, channel, levels, handle,
  *              radius, corner radius) plus "RESOLUTION (bits)" metadata. The
  *              curve is rebuilt here with the same geometry as the editor and
- *              sampled into RAM, then played through the two DACs.
+ *              sampled into RAM, then played through the two DACs. A channel
+ *              with a digital shape (only at 0 % or 100 % of its range, 2 %
+ *              off at most, edges no longer than one step) does not use a
+ *              DAC: it goes out on
+ *              its digital pin (channel N on output N, 0 or 3.3 V), so an
+ *              analog file is not limited to two channels.
  *
  * Big files: a digital file is first read once in 8 KB blocks (metadata,
  * row count, first/last step) with a percentage on screen. If its events fit
@@ -62,8 +67,9 @@
  * DevKit v1) and ESP32-S3 (DevKitC-1 and compatibles). Also builds as a
  * PlatformIO main.cpp: everything is declared before it is used.
  *
- * ESP32-S3: it has no DAC, so it plays digital files only (analog ones are
- * refused with a message) and its pins differ — see PIN CONFIGURATION. Build
+ * ESP32-S3: it has no DAC, so it plays digital files, and analog files only
+ * for their channels with a digital shape (one that needs the DAC for all its
+ * channels is refused with a message). Its pins differ — see PIN CONFIGURATION. Build
  * it with "USB CDC On Boot" enabled: the serial console then answers on both
  * connectors of the board, the native USB one and the UART bridge.
  */
@@ -172,12 +178,21 @@ static const gpio_num_t sigPins[NUM_CHANNELS] = {
 // GPIO 25, the second analog channel switches itself off.)
 #define ANA_PIN_CH0     26   // DAC2
 #define ANA_PIN_CH1     25   // DAC1
-#if ENCODER_BTN_PIN == ANA_PIN_CH1
+#if !SOC_DAC_SUPPORTED
+  #define ANA_NUM_CHANNELS 0
+#elif ENCODER_BTN_PIN == ANA_PIN_CH1
   #define ANA_NUM_CHANNELS 1
 #else
   #define ANA_NUM_CHANNELS 2
 #endif
-static const uint8_t anaPins[2] = { ANA_PIN_CH0, ANA_PIN_CH1 };
+static const uint8_t ANA_DAC_PINS[2] = { ANA_PIN_CH0, ANA_PIN_CH1 };
+// The DAC each analog output uses, set per file: a channel with a digital
+// shape on GPIO 26 (channel 1) takes that pin as a plain output, and the
+// analog channels then use DAC1 (GPIO 25) only.
+uint8_t anaPins[2] = { ANA_PIN_CH0, ANA_PIN_CH1 };
+
+// Channels an analog file can carry (as many as a digital one).
+#define ANA_MAX_FILE_CHANNELS 16
 
 // Analog curve sampling: up to ANA_MAX_SPP samples per step, and never more
 // than ANA_MAX_SAMPLES per channel (8-bit DAC values, 8 KB per channel).
@@ -401,6 +416,14 @@ String channelNames[NUM_CHANNELS] = {"CKP","CMP 1","CMP 2","CMP 3"};
 uint8_t *anaSamples[2] = { NULL, NULL };
 uint32_t anaCount      = 0;   // samples per channel
 uint8_t  anaChannels   = 0;   // analog outputs in use
+uint8_t  anaSrc[2]     = { 0, 0 };   // file channel (1-based) of each analog output
+
+// Channels of an analog file with a digital shape: they go out on the digital
+// pins as state changes, like a digital file. Bit c = channel c+1.
+uint16_t anaDigMask    = 0;   // channels with a digital shape that are played
+uint32_t anaDigGpio    = 0;   // their GPIO bits (channels 1-4)
+uint8_t  anaDigCount   = 0;
+bool     anaNeedsDac   = false;   // nothing playable: every channel needed a DAC
 
 // Analog curve geometry types. They live up here, before any function, because
 // the Arduino IDE writes a prototype for every function above the first one:
@@ -416,6 +439,13 @@ struct APiece {
   double corner;   // radius of the corner where this piece ends (0..1)
 };
 
+// A state change of the digital-shaped channels of an analog file: from
+// `pos` (steps from the start of the pass) on, bit c = channel c+1.
+struct AnaEdge {
+  float    pos;
+  uint16_t mask;
+};
+
 // One row of the analog file.
 struct AnaSeg {
   float   from, to;   // steps
@@ -427,6 +457,8 @@ struct AnaSeg {
   float   r;          // chord radius, 0..1
   float   endR;       // corner radius at the end point, 0..1
 };
+
+std::vector<AnaEdge> anaEdges;
 
 // Metadata extracted from signal file (optional, 0 if missing)
 float   metaVoltage    = 0.0f;   // VOLTAGE: read only, nothing uses it (yours to use)
@@ -1038,7 +1070,10 @@ String speedLabel() {
 
 // "Digital 4ch" / "Analog 1ch" — shown under the RPM.
 String modeLabel() {
-  if (signalMode == MODE_ANALOG) return "Analog " + String(anaChannels) + "ch";
+  if (signalMode == MODE_ANALOG) {
+    if (anaDigCount) return "Analog " + String(anaChannels) + "ch +" + String(anaDigCount) + " dig";
+    return "Analog " + String(anaChannels) + "ch";
+  }
   if (fileChannels > NUM_CHANNELS) {
     return "Digital " + String(NUM_CHANNELS) + "ch +" + String(fileChannels - NUM_CHANNELS) + " data";
   }
@@ -1762,6 +1797,10 @@ void freeAnaBuffers() {
   }
   anaCount = 0;
   anaChannels = 0;
+  anaDigMask = 0;
+  anaDigGpio = 0;
+  anaDigCount = 0;
+  anaEdges.clear();
 }
 
 // ──────────────────────────────────────────────
@@ -1772,12 +1811,107 @@ void freeAnaBuffers() {
 // come in path order. One pass of the signal runs from the earliest `from` to
 // the latest `to` of the channels being played; outside its own range a
 // channel holds its edge value.
+// Builds the path of file channel `ch` exactly like the editor. False if the
+// channel has no segments. `startHold` is what it holds before its first point.
+static bool buildAnaPath(const std::vector<AnaSeg> &segs, uint8_t ch, double maxLevel,
+                         APt &start, double &startHold, std::vector<APiece> &pieces) {
+  std::vector<APiece> raw;
+  bool haveStart = false;
+  start = { 0, 0 };
+  startHold = 0;
+  for (auto &s : segs) {
+    if (s.ch != ch) continue;
+    APt a = { s.from, clamp01d(s.l0 / maxLevel) };
+    APt b = { s.to,   clamp01d(s.l1 / maxLevel) };
+    if (!haveStart) {
+      start = a;
+      // Before its first point a channel holds that point's outgoing height —
+      // the one after the vertical edge, if it starts with one (as the editor).
+      startHold = (s.to == s.from) ? b.y : a.y;
+      haveStart = true;
+    }
+
+    size_t before = raw.size();
+    if (s.to == s.from) {
+      // Vertical edge: two heights on the same step line
+      if (fabs(b.y - a.y) < 1e-9) continue;
+      raw.push_back(linePiece(b));
+    } else if (s.straight) {
+      raw.push_back(linePiece(b));
+    } else {
+      chordPieces(a, b, s.t, clamp01d(s.h / maxLevel), s.r, raw);
+    }
+    // The piece that lands on the next connection point carries its corner.
+    if (raw.size() > before) raw.back().corner = s.endR;
+  }
+  pieces.clear();
+  if (!haveStart) return false;
+  roundCorners(start, raw, pieces);
+  return true;
+}
+
+// The same rule as the editor (digitalShapeOf in deviceSignal.ts): only at
+// the floor (0 %) or the ceiling (100 %) of the range, 2 % off at most, and
+// from one to the other with vertical edges or ramps of one step at most. The
+// edge falls in the middle of the ramp, where a logic input reads it.
+// In-between levels, curves and corners that stretch the edge are analog.
+static bool anaDigitalShape(const APt &start, const std::vector<APiece> &pieces,
+                            bool &initialHigh, std::vector<float> &edges) {
+  edges.clear();
+  if (pieces.empty()) return false;
+  // Every vertex of the path; a curve is visited at 8 points along it
+  auto visit = [&](auto f) -> bool {
+    APt from = start;
+    if (!f(start.x, start.y)) return false;
+    for (auto &p : pieces) {
+      if (p.quad) {
+        for (int k = 1; k < 8; k++) {
+          double x = from.x + (p.to.x - from.x) * k / 8.0;
+          if (!f(x, pieceYAt(from, p, x))) return false;
+        }
+      }
+      if (!f(p.to.x, p.to.y)) return false;
+      from = p.to;
+    }
+    return true;
+  };
+  const double tol = 0.02 + 1e-9;
+  bool first = true, out = false;
+  int cur = 0;
+  double xLevel = 0;
+  bool ok = visit([&](double x, double y) {
+    int b = y <= tol ? 0 : (y >= 1.0 - tol ? 1 : -1);
+    if (first) {
+      first = false;
+      if (b < 0) return false;
+      cur = b;
+      initialHigh = b == 1;
+      xLevel = x;
+      return true;
+    }
+    if (b < 0) { out = true; return true; }
+    if (b != cur) {
+      if (x - xLevel > 1.0 + 1e-6) return false;   // a slow ramp: analog
+      edges.push_back((float)((xLevel + x) / 2));
+      cur = b;
+    } else if (out) {
+      return false;                                 // left a level and came back: a curve
+    }
+    out = false;
+    xLevel = x;
+    return true;
+  });
+  if (!ok || out) { edges.clear(); return false; }
+  return true;
+}
+
 bool parseAnalogFile(const String &path) {
   freeSigBuffers();
   freeAnaBuffers();
   signalEvents.clear();
   signalTotalStepsF = 0.0f;
   signalTotalEvents = 0;
+  anaNeedsDac = false;
 
   File f = SD.open(path, FILE_READ);
   if (!f) {
@@ -1825,9 +1959,8 @@ bool parseAnalogFile(const String &path) {
     s.h        = s.straight ? s.l1 : fl[6].toFloat();
     s.r        = (fl[7] == "-") ? 0.0f : fl[7].toFloat() / 100.0f;
     s.endR     = (fl[8] == "-") ? 0.0f : fl[8].toFloat() / 100.0f;
-    if (ch < 1) continue;
+    if (ch < 1 || ch > ANA_MAX_FILE_CHANNELS) continue;
     if (ch > highestChannel) highestChannel = ch;
-    if (ch > ANA_NUM_CHANNELS) continue;   // no DAC left for it
     s.ch = (uint8_t)ch;
     segs.push_back(s);
   }
@@ -1835,10 +1968,6 @@ bool parseAnalogFile(const String &path) {
 
   if (skippedLines > 0) {
     Serial.printf("[ANA] WARNING: %d lines skipped (bad format)\n", skippedLines);
-  }
-  if (highestChannel > ANA_NUM_CHANNELS) {
-    Serial.printf("[ANA] WARNING: file has %d channels, only %d DAC output(s) — "
-                  "extra channels are not played\n", highestChannel, ANA_NUM_CHANNELS);
   }
   if (segs.empty()) {
     Serial.println(F("[ANA] No segments found"));
@@ -1848,10 +1977,7 @@ bool parseAnalogFile(const String &path) {
   int bits = (metaResolution >= 1 && metaResolution <= 16) ? metaResolution : 12;
   double maxLevel = (double)((1UL << bits) - 1);
 
-  // Channels to play: 1 .. highest channel present (capped at the DACs).
-  anaChannels = (uint8_t)min(highestChannel, ANA_NUM_CHANNELS);
-
-  // One pass = earliest start to latest end across the played channels.
+  // One pass = earliest start to latest end across the channels.
   double first = 1e30, last = -1e30;
   for (auto &s : segs) {
     if (s.from < first) first = s.from;
@@ -1860,7 +1986,75 @@ bool parseAnalogFile(const String &path) {
   double span = last - first;
   if (span <= 1e-6) {
     Serial.println(F("[ANA] Signal has no length"));
-    anaChannels = 0;
+    return false;
+  }
+
+  // ── Which channels have a digital shape ──
+  // They go out on their own pin as state changes; only the others need a DAC.
+  std::vector<APiece> pieces;
+  std::vector<float> edges;
+  std::vector<std::pair<float, uint16_t>> flips;   // (step, channel bit)
+  uint16_t present = 0, initial = 0;
+  for (int c = 0; c < highestChannel; c++) {
+    APt start;
+    double hold;
+    if (!buildAnaPath(segs, (uint8_t)(c + 1), maxLevel, start, hold, pieces)) continue;
+    present |= (uint16_t)(1u << c);
+    // A listened (RX) channel is driven by the other side: never an output
+    if (metaListenMask & (1u << c)) continue;
+    bool high = false;
+    if (!anaDigitalShape(start, pieces, high, edges)) continue;
+    anaDigMask |= (uint16_t)(1u << c);
+    if (high) initial |= (uint16_t)(1u << c);
+    for (float x : edges) flips.push_back({ x, (uint16_t)(1u << c) });
+    if (c < NUM_CHANNELS) anaDigGpio |= 1UL << sigPins[c];
+    anaDigCount++;
+  }
+  std::sort(flips.begin(), flips.end(),
+            [](const std::pair<float, uint16_t> &a, const std::pair<float, uint16_t> &b) { return a.first < b.first; });
+  if (anaDigMask) {
+    uint16_t mask = initial;
+    size_t k = 0;
+    // What changes right at the start is already the starting level
+    for (; k < flips.size() && flips[k].first <= first + 1e-6; k++) mask ^= flips[k].second;
+    anaEdges.push_back({ 0.0f, mask });
+    for (; k < flips.size() && flips[k].first < last - 1e-6; k++) {
+      mask ^= flips[k].second;
+      float pos = (float)(flips[k].first - first);
+      if (anaEdges.back().pos == pos) anaEdges.back().mask = mask;
+      else anaEdges.push_back({ pos, mask });
+    }
+  }
+
+  // ── The DACs, for the channels that really are analog ──
+  // Channel N prefers DAC N (channel 1 on GPIO 26, where CKP comes out),
+  // else the one left. A DAC whose pin is taken by a digital channel is out.
+  bool dacFree[2] = { false, false };
+  for (int k = 0; k < ANA_NUM_CHANNELS; k++) {
+    dacFree[k] = true;
+    for (int c = 0; c < NUM_CHANNELS; c++) {
+      if ((anaDigMask & (1u << c)) && sigPins[c] == (gpio_num_t)ANA_DAC_PINS[k]) dacFree[k] = false;
+    }
+  }
+  int unplayed = 0;
+  for (int c = 0; c < highestChannel; c++) {
+    if (!(present & (1u << c)) || (anaDigMask & (1u << c))) continue;
+    int k = (c < 2 && dacFree[c]) ? c : (dacFree[0] ? 0 : (dacFree[1] ? 1 : -1));
+    if (k < 0) { unplayed++; continue; }
+    dacFree[k] = false;
+    anaPins[anaChannels] = ANA_DAC_PINS[k];
+    anaSrc[anaChannels] = (uint8_t)(c + 1);
+    anaChannels++;
+  }
+  if (unplayed > 0) {
+    Serial.printf("[ANA] WARNING: %d analog channel(s) need a DAC and none is left (%d on this board) — "
+                  "not played. Channels with a digital shape do not need one.\n",
+                  unplayed, ANA_NUM_CHANNELS);
+  }
+  if (anaChannels == 0 && anaDigCount == 0) {
+    anaNeedsDac = unplayed > 0;
+    Serial.println(F("[ANA] Nothing to play"));
+    freeAnaBuffers();
     return false;
   }
 
@@ -1868,7 +2062,6 @@ bool parseAnalogFile(const String &path) {
   // time, so the count only sets the shape's resolution, never the speed.
   double want = span * ANA_MAX_SPP;
   anaCount = (uint32_t)min((double)ANA_MAX_SAMPLES, max(2.0, floor(want + 0.5)));
-
 
   for (uint8_t c = 0; c < anaChannels; c++) {
     anaSamples[c] = (uint8_t *)malloc(anaCount);
@@ -1878,39 +2071,9 @@ bool parseAnalogFile(const String &path) {
       return false;
     }
 
-    // ── Build this channel's path, exactly like the editor ──
-    std::vector<APiece> raw;
-    APt start = { 0, 0 };
-    bool haveStart = false;
-    // Before its first point a channel holds that point's outgoing height —
-    // the one after the vertical edge, if it starts with one (as the editor).
-    double startHold = 0;
-    for (auto &s : segs) {
-      if (s.ch != c + 1) continue;
-      APt a = { s.from, clamp01d(s.l0 / maxLevel) };
-      APt b = { s.to,   clamp01d(s.l1 / maxLevel) };
-      if (!haveStart) {
-        start = a;
-        startHold = (s.to == s.from) ? b.y : a.y;
-        haveStart = true;
-      }
-
-      size_t before = raw.size();
-      if (s.to == s.from) {
-        // Vertical edge: two heights on the same step line
-        if (fabs(b.y - a.y) < 1e-9) continue;
-        raw.push_back(linePiece(b));
-      } else if (s.straight) {
-        raw.push_back(linePiece(b));
-      } else {
-        chordPieces(a, b, s.t, clamp01d(s.h / maxLevel), s.r, raw);
-      }
-      // The piece that lands on the next connection point carries its corner.
-      if (raw.size() > before) raw.back().corner = s.endR;
-    }
-
-    std::vector<APiece> pieces;
-    roundCorners(start, raw, pieces);
+    APt start;
+    double startHold;
+    bool haveStart = buildAnaPath(segs, anaSrc[c], maxLevel, start, startHold, pieces);
 
     // ── Sample it ──
     size_t k = 0;
@@ -1935,8 +2098,14 @@ bool parseAnalogFile(const String &path) {
     }
 
     Serial.printf("[ANA] CH%d: %d pieces → %u samples (DAC GPIO %u)\n",
-                  c + 1, (int)pieces.size(), (unsigned)anaCount, (unsigned)anaPins[c]);
+                  anaSrc[c], (int)pieces.size(), (unsigned)anaCount, (unsigned)anaPins[c]);
   }
+  for (int c = 0; c < highestChannel; c++) {
+    if (!(anaDigMask & (1u << c))) continue;
+    if (c < NUM_CHANNELS) Serial.printf("[ANA] CH%d: digital shape → GPIO %u\n", c + 1, (unsigned)sigPins[c]);
+    else Serial.printf("[ANA] CH%d: digital shape → writeExtraChannels()\n", c + 1);
+  }
+  if (anaDigCount) Serial.printf("[ANA] %u state changes per pass on the digital channels\n", (unsigned)anaEdges.size());
 
   signalTotalStepsF = (float)span;
   signalTotalEvents = (int)segs.size();
@@ -2147,6 +2316,26 @@ void sigGenTask(void *param) {
   vTaskDelete(NULL);   // self-delete
 }
 
+// The digital-shaped channels of an analog file, all at once: channels 1-4
+// on their pins, the rest to writeExtraChannels().
+static inline void writeAnaDigital(uint16_t m) {
+  uint32_t set = 0;
+  for (int c = 0; c < NUM_CHANNELS; c++) {
+    if ((anaDigMask & m) & (1u << c)) set |= 1UL << sigPins[c];
+  }
+  GPIO.out_w1ts = set;
+  GPIO.out_w1tc = anaDigGpio & ~set;
+  if (anaDigMask >> NUM_CHANNELS) {
+    extraChannels = (uint16_t)((m & anaDigMask) >> NUM_CHANNELS);
+    writeExtraChannels(extraChannels);
+  }
+}
+
+static inline void clearAnaDigital() {
+  GPIO.out_w1tc = anaDigGpio;
+  if (anaDigMask >> NUM_CHANNELS) { extraChannels = 0; writeExtraChannels(0); }
+}
+
 // Analog generator task — also on Core 0.
 // Instead of stepping sample by sample, it follows the clock: every pass it
 // measures the elapsed time, advances the position by elapsed / tickUs steps
@@ -2154,6 +2343,8 @@ void sigGenTask(void *param) {
 // every sample at high RPM (dacWrite takes a few µs), so some get skipped —
 // but a revolution always lasts exactly 60 000 000 / RPM µs. Reading tickUs
 // every pass makes RPM changes take effect immediately, without a jump.
+// The digital-shaped channels change as soon as the position passes each of
+// their edges: the loop never sleeps, so that is within a few µs.
 void anaGenTask(void *param) {
   disableCore0WDT();
 
@@ -2162,22 +2353,34 @@ void anaGenTask(void *param) {
   double   pos     = 0.0;                            // position in steps
   int64_t  prev    = esp_timer_get_time();
   uint32_t lastIdx = UINT32_MAX;
+  const size_t nEdges = anaEdges.size();
+  size_t   edge    = 0;                              // next digital change
+  // Until the first change, what the end of the pass left
+  if (nEdges) writeAnaDigital(anaEdges[nEdges - 1].mask);
 
   while (isPlaying) {
     if (isPaused) {
       for (uint8_t c = 0; c < anaChannels; c++) dacWrite(anaPins[c], 0);
+      if (nEdges) clearAnaDigital();
       while (isPaused && isPlaying) {
         vTaskDelay(pdMS_TO_TICKS(10));
       }
       prev = esp_timer_get_time();   // resume where it paused
       lastIdx = UINT32_MAX;
+      if (nEdges) writeAnaDigital(anaEdges[edge ? edge - 1 : nEdges - 1].mask);
       if (!isPlaying) break;
     }
 
     int64_t now = esp_timer_get_time();
     pos += (double)(now - prev) / (double)tickUs;
     prev = now;
-    while (pos >= total) { pos -= total; loopCount = loopCount + 1; }
+    bool wrapped = false;
+    while (pos >= total) { pos -= total; loopCount = loopCount + 1; wrapped = true; }
+    if (wrapped && nEdges) {
+      if (edge < nEdges) writeAnaDigital(anaEdges[nEdges - 1].mask);   // what the pass left unwritten
+      edge = 0;
+    }
+    while (edge < nEdges && (double)anaEdges[edge].pos <= pos) writeAnaDigital(anaEdges[edge++].mask);
 
     uint32_t idx = (uint32_t)(pos * perStep);
     if (idx >= anaCount) idx = anaCount - 1;
@@ -2188,6 +2391,7 @@ void anaGenTask(void *param) {
   }
 
   for (uint8_t c = 0; c < anaChannels; c++) dacWrite(anaPins[c], 0);
+  if (nEdges) clearAnaDigital();
 
   enableCore0WDT();
 
@@ -2464,7 +2668,7 @@ void startPlayback() {
       Serial.println(F("[PLAY] Buffer allocation failed!"));
       return;
     }
-  } else if (anaCount == 0 || anaChannels == 0) {
+  } else if (anaCount == 0 || (anaChannels == 0 && anaEdges.empty())) {
     Serial.println(F("[PLAY] No analog samples loaded!"));
     return;
   }
@@ -2553,6 +2757,7 @@ void stopPlayback() {
   for (int c = 0; c < NUM_CHANNELS; c++) {
     gpio_set_level(sigPins[c], 0);
   }
+  if (signalMode == MODE_ANALOG && (anaDigMask >> NUM_CHANNELS)) { extraChannels = 0; writeExtraChannels(0); }
   if (streamMode) stopStreaming();
   freeSigBuffers();
   Serial.printf("[PLAY] Stopped after %u loops\n", (unsigned)loopCount);
@@ -2606,19 +2811,6 @@ bool openSignalFile(const String &path, const String &name, bool askUnit) {
   Serial.printf("[FILE] Opening %s\n", path.c_str());
 
   bool analog = isAnalogFile(path);
-#if !SOC_DAC_SUPPORTED
-  if (analog) {
-    Serial.println(F("[FILE] Analog file: this board has no DAC (ESP32-S3), digital files only"));
-    if (oledPresent) {
-      u8g2.clearBuffer();
-      u8g2.drawStr(4, 28, "Analog file:");
-      u8g2.drawStr(4, 44, "needs ESP32 (DAC)");
-      u8g2.sendBuffer();
-      delay(2000);
-    }
-    return false;
-  }
-#endif
   bool ok;
   streamMode = false;
   if (analog) {
@@ -2651,6 +2843,18 @@ bool openSignalFile(const String &path, const String &name, bool askUnit) {
                       (unsigned)info.rows, (unsigned)heap);
       }
     }
+  }
+  if (!ok && analog && anaNeedsDac) {
+    // Every channel is really analog and there is no DAC for them (ESP32-S3)
+    Serial.println(F("[FILE] Analog file: its channels need a DAC and this board has none"));
+    if (oledPresent) {
+      u8g2.clearBuffer();
+      u8g2.drawStr(4, 28, "Analog file:");
+      u8g2.drawStr(4, 44, "needs ESP32 (DAC)");
+      u8g2.sendBuffer();
+      delay(2000);
+    }
+    return false;
   }
   if (!ok) {
     streamMode = false;

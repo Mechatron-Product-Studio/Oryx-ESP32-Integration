@@ -49,6 +49,13 @@
  *               entra en MAX_MUESTRAS, llega por streaming como tramos rectos
  *               (las curvas ya partidas por la app) que el micro interpola en
  *               vivo: sin tope de largo y sin perder resolución.
+ *               Los DAC son solo dos, así que la app no les manda lo que
+ *               tiene forma digital (solo el 0 % o el 100 % de su rango, ±2 %,
+ *               y flancos rectos, como un Hall o una leva): esos canales
+ *               llegan como filas de cambio de estado (o como una máscara en
+ *               cada tramo del streaming) y salen por los pines digitales,
+ *               junto con lo que sale por el DAC. Una analógica que es toda
+ *               digital llega como digital.
  *
  * El tiempo se mide con el contador de ciclos de la CPU (240 por µs) en punto
  * fijo, así que un paso puede durar hasta 2,5 µs (relojes de 200 kHz) y cada
@@ -292,7 +299,9 @@ struct Fila {
  * Un evento del streaming: lo que dura (en pasos) y cómo quedan los canales.
  * En digital, `mask` es la máscara de canales. En analógico es un tramo
  * recto: durante `dur` pasos la salida va desde donde quedó hasta `mask`
- * (nivel del canal 0) y `extra` (canal 1); con `dur` 0 salta.
+ * (nivel del canal 0) y `extra` (canal 1); con `dur` 0 salta. Con canales
+ * de forma digital, `mask` es su máscara (vale desde el final del tramo) y
+ * `extra` lleva los dos niveles ya en escalones del DAC (ver guardarEvento).
  */
 struct EventoFlujo {
   float    dur;
@@ -318,6 +327,11 @@ static uint8_t  spp           = 16;      // muestras por paso
 static uint32_t nivelMax      = 4095;    // fondo de escala de las muestras
 
 static uint8_t  nCanales      = 0;       // canales realmente cargados
+/**
+ * En analógico, los canales con forma digital: salen por PINES como una
+ * máscara (filas en memoria, o la máscara de cada tramo del streaming).
+ */
+static uint8_t  nCanalesD     = 0;
 static uint8_t  modo          = MODO_NADA;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -424,13 +438,17 @@ static inline void escribirCanalesExtra(uint8_t bits) {
 static volatile uint8_t mascaraEntrada    = 0;
 static volatile uint8_t mascaraCompartida = 0;
 
-/** Pone los canales cargados como dice la máscara, todos juntos. */
+/**
+ * Pone los canales cargados como dice la máscara, todos juntos. En analógico
+ * son los de forma digital; los del DAC van por su lado.
+ */
 static inline void escribirMask(uint16_t m) {
-  const uint16_t cargados = (uint16_t)((1UL << nCanales) - 1);
+  const uint8_t  n        = modo == MODO_ANALOGICO ? nCanalesD : nCanales;
+  const uint16_t cargados = (uint16_t)((1UL << n) - 1);
   const uint8_t  conPin   = (uint8_t)(cargados & 0xFF & ~mascaraEntrada);
   REG_WRITE(GPIO_OUT_W1TS_REG, gpioDe[m & conPin]);
   REG_WRITE(GPIO_OUT_W1TC_REG, gpioDe[~m & conPin]);
-  if (nCanales > CANALES_CON_PIN) {
+  if (n > CANALES_CON_PIN) {
     canalesExtra = (uint8_t)((m & cargados) >> CANALES_CON_PIN);
     escribirCanalesExtra(canalesExtra);
   }
@@ -464,6 +482,10 @@ static inline void escribirDac(uint8_t c, uint8_t v) {
 static void encenderDacs() {
   for (uint8_t c = 0; c < MAX_CANALES_A; c++) dacWrite(PINES_DAC[c], 0);
 }
+#else
+// Sin DAC (S3) una analógica igual saca sus canales de forma digital
+static inline void escribirDac(uint8_t, uint8_t) {}
+static void encenderDacs() {}
 #endif
 
 /** Todo abajo: es donde queda la señal cuando está parada. */
@@ -899,21 +921,22 @@ static void reproducirFlujo() {
  * exactamente lo pedido; dentro del tramo se escribe en cada pasada el nivel
  * que toca y el DAC solo se toca cuando cambia de escalón. Lejos del próximo
  * escalón se cede el procesador, como en la de memoria. Si el búfer se
- * vacía, la salida se sostiene y se cuenta una falta.
+ * vacía, la salida se sostiene y se cuenta una falta. Los canales de forma
+ * digital cambian al final de cada tramo, que es donde la app puso sus flancos.
  */
 static void reproducirFlujoAnalogico() {
-#if HAY_ANALOGICAS
   const float   ciclosPorUs = (float)getCpuFrequencyMhz();
   const float   umbral      = 2000.0f * ciclosPorUs;
   const float   aEscalon    = nivelMax ? 255.0f / (float)nivelMax : 0.0f;   // nivel → escalón del DAC
+  // Con canales digitales los niveles ya llegan en escalones (ver guardarEvento)
+  const bool    conMascara  = nCanalesD > 0;
   const uint8_t n           = nCanales < MAX_CANALES_A ? nCanales : MAX_CANALES_A;
   uint64_t idealQ = ciclos64() << 16;
   float    ultimoPaso = -1.0f, pasoQ = 0.0f;
   uint32_t enVuelta = 0;
   double   posVuelta = 0;
-  float    desde[MAX_CANALES_A] = {};
-  int16_t  escrito[MAX_CANALES_A];
-  for (uint8_t c = 0; c < MAX_CANALES_A; c++) escrito[c] = -1;
+  float    desde[2] = {};                       // en escalones del DAC
+  int16_t  escrito[2] = { -1, -1 };
   if (bucle) idxBucle = 0;
   encenderDacs();
 
@@ -934,7 +957,10 @@ static void reproducirFlujoAnalogico() {
     posVuelta += e.dur;
     if (++enVuelta >= eventosPorVuelta) { enVuelta = 0; posVuelta = 0; vueltas = vueltas + 1; }
 
-    const float hasta[2] = { (float)e.mask, (float)e.extra };
+    const uint16_t crudo[2] = { e.mask, e.extra };
+    float hasta[2];
+    if (conMascara) { hasta[0] = (float)(e.extra & 0xFF); hasta[1] = (float)(e.extra >> 8); }
+    else            { hasta[0] = crudo[0] * aEscalon;     hasta[1] = crudo[1] * aEscalon; }
     const float us = usPaso;
     if (us != ultimoPaso) { ultimoPaso = us; pasoQ = us * ciclosPorUs * 65536.0f; }
     const uint64_t t0 = (idealQ + 32768) >> 16;
@@ -943,8 +969,6 @@ static void reproducirFlujoAnalogico() {
 
     if (t1 > t0) {
       const float largo = (float)(t1 - t0);
-      float ea[MAX_CANALES_A], eb[MAX_CANALES_A];
-      for (uint8_t c = 0; c < n; c++) { ea[c] = desde[c] * aEscalon; eb[c] = hasta[c] * aEscalon; }
       while (true) {
         if (!corriendo || (bucle && pedidoReinicio)) return;
         const uint64_t ahora = ciclos64();
@@ -954,14 +978,14 @@ static void reproducirFlujoAnalogico() {
         if (u < 0.0f) u = 0.0f;
         float espera = (float)falta;               // ciclos hasta el próximo escalón
         for (uint8_t c = 0; c < n; c++) {
-          const float d = eb[c] - ea[c];
-          int16_t esc = (int16_t)(ea[c] + d * u);
+          const float d = hasta[c] - desde[c];
+          int16_t esc = (int16_t)(desde[c] + d * u);
           if (esc < 0) esc = 0;
           if (esc > 255) esc = 255;
           if (esc != escrito[c]) { escribirDac(c, (uint8_t)esc); escrito[c] = esc; }
           if (d != 0.0f) {
             const float borde = d > 0.0f ? (float)(esc + 1) : (float)esc;
-            const float t = ((borde - ea[c]) / d - u) * largo;
+            const float t = ((borde - desde[c]) / d - u) * largo;
             if (t < espera) espera = t;
           }
         }
@@ -969,12 +993,12 @@ static void reproducirFlujoAnalogico() {
       }
     }
     for (uint8_t c = 0; c < n; c++) {
-      const int16_t esc = aDac((uint16_t)hasta[c]);
+      const int16_t esc = conMascara ? (int16_t)hasta[c] : aDac(crudo[c]);
       if (esc != escrito[c]) { escribirDac(c, (uint8_t)esc); escrito[c] = esc; }
       desde[c] = hasta[c];
     }
+    if (conMascara) escribirMask(e.mask);
   }
-#endif
 }
 
 /**
@@ -983,14 +1007,20 @@ static void reproducirFlujoAnalogico() {
  * escribe la muestra que toca. Si el DAC no llega a escribirlas todas (rpm
  * altas con muchas muestras por paso) se saltea alguna, pero la vuelta dura
  * siempre lo que tiene que durar.
+ *
+ * Los canales de forma digital van en filas, como en digital, y se escriben
+ * apenas la posición pasa por cada una: con el mismo reloj, a unos pocos µs
+ * de su lugar (el bucle no cede el procesador cerca de un flanco).
  */
 static void reproducirAnalogico() {
   int64_t  antes  = esp_timer_get_time();
   double   m      = 0;                    // posición, en muestras
   uint32_t ultima = UINT32_MAX;
-#if HAY_ANALOGICAS
+  const bool hayFilas = nCanalesD > 0 && nFilas > 0;
+  uint16_t j = 0;                         // la próxima fila digital
+  // Hasta la primera fila sigue lo que dejó el final de la vuelta
+  if (hayFilas) escribirMask(filas[nFilas - 1].mask);
   encenderDacs();
-#endif
   vueltaCaptura();                        // empieza una vuelta
 
   while (corriendo) {
@@ -1004,7 +1034,19 @@ static void reproducirAnalogico() {
     antes = ahora;
     bool nuevaVuelta = false;
     while (m >= (double)nMuestras) { m -= (double)nMuestras; vueltas = vueltas + 1; nuevaVuelta = true; }
-    if (nuevaVuelta) vueltaCaptura();
+    if (nuevaVuelta) {
+      vueltaCaptura();
+      // Lo que quedó sin escribir del final de la vuelta anterior
+      if (hayFilas && j < nFilas) escribirMask(filas[nFilas - 1].mask);
+      j = 0;
+    }
+
+    // Los digitales, en pasos: todas las filas que la posición ya pasó
+    const double paso = m * (double)pasosTotales / (double)nMuestras;
+    if (hayFilas) {
+      while (j < nFilas && (double)filas[j].pos <= paso) { escribirMask(filas[j].mask); j++; }
+      if (nCanales == 0) posActual = (float)paso;   // sin muestras, la posición sale de acá
+    }
 
     const uint32_t i = (uint32_t)m;
     if (i != ultima) {
@@ -1017,7 +1059,15 @@ static void reproducirAnalogico() {
       posActual = (float)i / (float)spp;
     }
 
-    if (((double)(i + 1) - m) * usMuestra > 2000) vTaskDelay(1);
+    // Se cede el procesador solo lejos de la próxima muestra y del próximo flanco
+    double espera = ((double)(i + 1) - m) * usMuestra;
+    if (hayFilas) {
+      // Pasada la última fila, la próxima es la primera de la vuelta siguiente
+      const double proxima = j < nFilas ? (double)filas[j].pos : (double)pasosTotales;
+      const double hastaFila = (proxima - paso) * (double)usPaso;
+      if (hastaFila < espera) espera = hastaFila;
+    }
+    if (espera > 2000) vTaskDelay(1);
   }
 }
 
@@ -1874,25 +1924,29 @@ static void mandarSaludo() {
     snprintf(pe + n, sizeof(pe) - n, i ? ",%u" : "%u", (unsigned)PINES_ADC[i]);
   }
 #endif
-  // Los dos últimos: si acepta analógicas por streaming (y el bucle con SI),
-  // y cuántos eventos entran en un bucle.
-  decirf("READY %u %s %u %u %u %u %u %s %s %s %u %u %s %u %u %u",
+  // Al final: si acepta analógicas por streaming (y el bucle con SI), cuántos
+  // eventos entran en un bucle y cuántos canales de forma digital saca por
+  // los pines en una analógica, junto al DAC.
+  decirf("READY %u %s %u %u %u %u %u %s %s %s %u %u %s %u %u %u %u",
          (uint32_t)PROTO, nombreEquipo,
          (uint32_t)MAX_CANALES_D, (uint32_t)MAX_CANALES_A,
          (uint32_t)MAX_FILAS, (uint32_t)MAX_MUESTRAS,
          V_MAX_MV, CHIP, pd, pa,
          anillo ? capAnillo : capacidadAnillo(),
-         capacidadCaptura(), pe, PERIODO_MIN_ADC_US, MAX_CANALES_A > 0 ? 1u : 0u, capacidadBucle());
+         capacidadCaptura(), pe, PERIODO_MIN_ADC_US, MAX_CANALES_A > 0 ? 1u : 0u, capacidadBucle(),
+         (uint32_t)MAX_CANALES_D);
 }
 
 // ── Streaming ──────────────────────────────────────────────────────────────
 //
-// SBEGIN <canales> <pasos> <eventosPorVuelta> [<D|A> <bits> <bucle>]
+// SBEGIN <canales> <pasos> <eventosPorVuelta> [<D|A> <bits> <bucle> [<digitales>]]
 //                 para todo y arma el búfer. Contesta SREADY <capacidad> <bucle>:
 //                 con bucle 1 (pedido por la app y la vuelta entra) la vuelta
 //                 se guarda y se repite, y la app la manda una sola vez.
+//                 `digitales` (analógico): canales de forma digital, por los pines.
 // S <base64>      digital: eventos de 6 bytes, float32 duración en pasos + uint16 máscara
 //                 analógico: float32 duración en pasos + uint16 nivel por canal
+//                 [+ uint16 máscara de los digitales, que vale al final del tramo]
 // SPRIMED         la app terminó de cebar el búfer: se contesta LOADED
 // Mientras dura, el equipo informa cada 25 ms SFREE <libres> <recibidos> <faltas>:
 // la app nunca manda más de lo que entra (lo que viaja se descuenta).
@@ -1985,20 +2039,28 @@ static void cmdSBegin(char* args) {
   const char* sTipo  = strtok_r(nullptr, " ", &resto);
   const char* sBits  = strtok_r(nullptr, " ", &resto);
   const char* sBucle = strtok_r(nullptr, " ", &resto);
+  const char* sDig   = strtok_r(nullptr, " ", &resto);
   if (!sCan || !sPas || !sEv) { decir("ERR SBEGIN incompleto"); return; }
   const bool analogico = sTipo && sTipo[0] == 'A';
-  // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí
-  if (analogico && MAX_CANALES_A == 0) { decir("ERR este equipo no tiene salidas analógicas"); return; }
+  int digitales = analogico && sDig ? atoi(sDig) : 0;
+  if (digitales < 0) digitales = 0;
+  if (digitales > MAX_CANALES_D) digitales = MAX_CANALES_D;
+  // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí.
+  // Sin DAC, una analógica solo puede sacar sus canales de forma digital
+  if (analogico && MAX_CANALES_A == 0 && digitales == 0) { decir("ERR este equipo no tiene salidas analógicas"); return; }
 
   detenerYEsperar();
   cortarCaptura(CAP_FIN_CORTADA);
   capPedida = false;
   capContinua = false;                   // hasta el CAP de esta carga
   liberarAnillo();
-  const int pedidos = atoi(sCan);
-  if (pedidos <= 0) { decir("ERR sin canales"); return; }
-  // Los eventos traen un nivel por canal pedido, aunque solo se usen los que hay
-  bytesEvento = analogico ? (uint8_t)(4 + 2 * (pedidos > 2 ? 2 : pedidos)) : 6;
+  int pedidos = atoi(sCan);
+  if (pedidos < 0) pedidos = 0;
+  if (pedidos == 0 && digitales == 0) { decir("ERR sin canales"); return; }
+  if (pedidos > 8) pedidos = 8;
+  // Los eventos traen un nivel por canal pedido, aunque solo se usen los que
+  // hay, y la máscara de los digitales al final
+  bytesEvento = analogico ? (uint8_t)(4 + 2 * pedidos + (digitales > 0 ? 2 : 0)) : 6;
   const uint8_t tope = analogico ? MAX_CANALES_A : MAX_CANALES_D;
   uint8_t canales = (uint8_t)(pedidos > tope ? tope : pedidos);
 
@@ -2023,6 +2085,7 @@ static void cmdSBegin(char* args) {
   bucle        = enBucle;
   idxBucle     = 0;
   nCanales     = canales;
+  nCanalesD    = (uint8_t)digitales;
   pasosTotalesD = atof(sPas);
   pasosTotales = (float)pasosTotalesD;
   if (analogico) {
@@ -2042,6 +2105,27 @@ static void cmdSBegin(char* args) {
   decirf("SREADY %u %u", capAnillo, bucle ? 1u : 0u);
 }
 
+/**
+ * Un evento llegado por la red, a la forma del búfer. Una analógica con
+ * canales digitales no entra en 8 bytes con dos niveles de 16 bits y la
+ * máscara: los niveles se guardan ya en escalones del DAC (`extra`, el canal
+ * 0 abajo) y la máscara en `mask`. El DAC tiene 8 bits, así que no se pierde
+ * nada que llegue a la salida.
+ */
+static inline void guardarEvento(EventoFlujo& e, const uint8_t* b) {
+  memcpy(&e.dur, b, 4);
+  if (modo == MODO_ANALOGICO && nCanalesD > 0) {
+    const uint8_t niveles = (uint8_t)((bytesEvento - 6) / 2);
+    const uint8_t d0 = niveles > 0 ? aDac((uint16_t)(b[4] | (b[5] << 8))) : 0;
+    const uint8_t d1 = niveles > 1 ? aDac((uint16_t)(b[6] | (b[7] << 8))) : 0;
+    e.extra = (uint16_t)(d0 | (d1 << 8));
+    e.mask  = (uint16_t)(b[bytesEvento - 2] | (b[bytesEvento - 1] << 8));
+    return;
+  }
+  e.mask  = (uint16_t)(b[4] | (b[5] << 8));
+  e.extra = bytesEvento >= 8 ? (uint16_t)(b[6] | (b[7] << 8)) : 0;
+}
+
 /** Una tanda de eventos en base64. Lo que no entra se descarta y se avisa. */
 static void cmdS(char* args) {
   if (!flujo || !anillo || !args) return;
@@ -2052,10 +2136,7 @@ static void cmdS(char* args) {
     // En bucle entra una vuelta y nada más: lo demás pisaría la guardada
     if (bucle ? cabeza >= eventosPorVuelta : cabeza - cola >= capAnillo) { perdidos++; continue; }
     EventoFlujo& e = anillo[bucle ? cabeza : (cabeza & (capAnillo - 1))];
-    const uint8_t* b = crudo + k * bytesEvento;
-    memcpy(&e.dur, b, 4);
-    e.mask  = (uint16_t)(b[4] | (b[5] << 8));
-    e.extra = bytesEvento >= 8 ? (uint16_t)(b[6] | (b[7] << 8)) : 0;
+    guardarEvento(e, crudo + k * bytesEvento);
     __sync_synchronize();                // el evento queda escrito antes de publicarlo
     cabeza = cabeza + 1;
   }
@@ -2087,11 +2168,7 @@ static void cmdSI(char* args) {
   const size_t n = bytes / bytesEvento;
   if (cabeza + n > eventosPorVuelta) return;
   for (size_t k = 0; k < n; k++) {
-    EventoFlujo& e = anillo[cabeza];
-    const uint8_t* b = crudo + k * bytesEvento;
-    memcpy(&e.dur, b, 4);
-    e.mask  = (uint16_t)(b[4] | (b[5] << 8));
-    e.extra = bytesEvento >= 8 ? (uint16_t)(b[6] | (b[7] << 8)) : 0;
+    guardarEvento(anillo[cabeza], crudo + k * bytesEvento);
     __sync_synchronize();
     cabeza = cabeza + 1;
   }
@@ -2100,7 +2177,11 @@ static void cmdSI(char* args) {
 
 // ── Comandos ───────────────────────────────────────────────────────────────
 
-/** Arranca una carga nueva: BEGIN <D|A> <canales> <pasos> <bits> <spp> */
+/**
+ * Arranca una carga nueva: BEGIN <D|A> <canales> <pasos> <bits> <spp> [<digitales>]
+ * `digitales` (analógico): canales de forma digital, que llegan como filas D
+ * después de las muestras y salen por los pines.
+ */
 static void cmdBegin(char* args) {
   char* resto = nullptr;
   const char* tipo  = strtok_r(args, " ", &resto);
@@ -2108,14 +2189,19 @@ static void cmdBegin(char* args) {
   const char* sPas  = strtok_r(nullptr, " ", &resto);
   const char* sBits = strtok_r(nullptr, " ", &resto);
   const char* sSpp  = strtok_r(nullptr, " ", &resto);
+  const char* sDig  = strtok_r(nullptr, " ", &resto);
   if (!tipo || !sCan || !sPas) { decir("ERR BEGIN incompleto"); return; }
 
   const uint8_t nuevoModo = (tipo[0] == 'A') ? MODO_ANALOGICO : MODO_DIGITAL;
   const uint8_t tope = nuevoModo == MODO_ANALOGICO ? MAX_CANALES_A : MAX_CANALES_D;
+  int digitales = nuevoModo == MODO_ANALOGICO && sDig ? atoi(sDig) : 0;
+  if (digitales < 0) digitales = 0;
+  if (digitales > MAX_CANALES_D) digitales = MAX_CANALES_D;
   // Se contesta antes de tocar nada: la señal que estaba cargada sigue ahí.
-  // Sin DAC (S3), una analógica sin salidas igual entra: es para medir
+  // Sin DAC (S3), una analógica sin salidas igual entra: es para medir, o
+  // para sacar sus canales de forma digital
   const bool soloMedir = nuevoModo == MODO_ANALOGICO && atoi(sCan) == 0 && MAX_ENTRADAS_A > 0;
-  if (tope == 0 && !soloMedir) { decir("ERR este equipo no tiene salidas analógicas"); return; }
+  if (tope == 0 && !soloMedir && digitales == 0) { decir("ERR este equipo no tiene salidas analógicas"); return; }
 
   detenerYEsperar();
   // Los pines que escuchan siguen siendo entradas: volverlos salidas aunque
@@ -2127,11 +2213,12 @@ static void cmdBegin(char* args) {
   liberarAnillo();                       // una señal que entra en memoria deja el streaming
   uint8_t canales = (uint8_t)atoi(sCan);
   // Una analógica sin salidas sirve para medir: solo da el largo de la vuelta
-  if (canales == 0 && (nuevoModo == MODO_DIGITAL || MAX_ENTRADAS_A == 0)) { decir("ERR sin canales"); return; }
+  if (canales == 0 && digitales == 0 && (nuevoModo == MODO_DIGITAL || MAX_ENTRADAS_A == 0)) { decir("ERR sin canales"); return; }
   if (canales > tope) canales = tope;
 
   modo         = nuevoModo;
   nCanales     = canales;
+  nCanalesD    = (uint8_t)digitales;
   pasosTotalesD = atof(sPas);
   pasosTotales = (float)pasosTotalesD;
   nivelMax     = sBits ? ((1UL << (uint8_t)atoi(sBits)) - 1) : 4095;
@@ -2148,9 +2235,9 @@ static void cmdBegin(char* args) {
   salidasIdle();
 }
 
-/** Una fila digital: D <paso> <mascara> */
+/** Una fila digital: D <paso> <mascara> (en analógico, la de los canales de forma digital) */
 static void cmdFila(char* args) {
-  if (!cargando || modo != MODO_DIGITAL) return;
+  if (!cargando || !(modo == MODO_DIGITAL || (modo == MODO_ANALOGICO && nCanalesD > 0))) return;
   char* resto = nullptr;
   const char* sPos  = strtok_r(args, " ", &resto);
   const char* sMask = strtok_r(nullptr, " ", &resto);
@@ -2195,10 +2282,13 @@ static void cmdMuestras(char* args) {
 #endif
 }
 
-/** Cierra la carga: END <filas esperadas> */
+/** Cierra la carga: END <filas esperadas> (analógico: END <muestras> [<filas>]) */
 static void cmdEnd(char* args) {
   cargando = false;
-  const uint32_t esperadas = args ? strtoul(args, nullptr, 10) : 0;
+  char* resto = nullptr;
+  const uint32_t esperadas = args ? strtoul(args, &resto, 10) : 0;
+  // Analógica con canales digitales: las filas que llegaron tras las muestras
+  const uint32_t filasEsperadas = resto ? strtoul(resto, nullptr, 10) : 0;
   // Una carga incompleta no se reproduce: se reproduciría otra señal que la dibujada
   if (modo == MODO_DIGITAL && esperadas > 0 && filasVistas != esperadas) {
     decirf("ERR llegaron %u de %u filas", (uint32_t)filasVistas, esperadas);
@@ -2225,11 +2315,20 @@ static void cmdEnd(char* args) {
     }
   }
 #endif
+  if (modo == MODO_ANALOGICO && nCanalesD > 0) {
+    if (filasVistas != filasEsperadas || filasVistas > MAX_FILAS || nFilas == 0) {
+      decirf("ERR llegaron %u de %u filas digitales (entran %u)",
+             (uint32_t)filasVistas, filasEsperadas, (uint32_t)MAX_FILAS);
+      modo = MODO_NADA;
+      return;
+    }
+  }
   if (pasosTotales <= 0) { decir("ERR la señal no tiene largo"); return; }
-  // Sin salidas (solo se mide): una muestra por vuelta marca el ritmo
+  // Sin salidas del DAC (solo se mide, o solo hay digitales): una muestra
+  // por vuelta marca el ritmo
   if (modo == MODO_ANALOGICO && nCanales == 0) nMuestras = 1;
 
-  if (modo == MODO_DIGITAL) prepararFilas();
+  if (modo == MODO_DIGITAL || nCanalesD > 0) prepararFilas();
   recalcularFactor();
   resolverRitmo();
   pedidoReinicio = true;
